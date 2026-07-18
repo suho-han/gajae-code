@@ -55,12 +55,13 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("name: dev-affected-shard-${{ github.run_id }}-${{ strategy.job-index }}");
 		expect(workflow).toContain("pattern: dev-affected-shard-${{ github.run_id }}-*");
 		expect(workflow).not.toContain("github.run_attempt");
-		expect(workflow.match(/overwrite: true/g)).toHaveLength(3);
+		expect(workflow.match(/overwrite: true/g)).toHaveLength(4);
 		expect(workflow.match(/dev-affected-plan-\$\{\{ github\.run_id \}\}/g)).toHaveLength(4);
 		expect(workflow.match(/dev-affected-native-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
 		expect(workflow.match(/dev-affected-shard-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
+		expect(workflow).toContain("name: dev-affected-evidence-${{ github.run_id }}");
 		expect(workflow).toContain("include-hidden-files: true");
-		expect(workflow.match(/include-hidden-files: true/g)).toHaveLength(2);
+		expect(workflow.match(/include-hidden-files: true/g)).toHaveLength(3);
 		expect(workflow).toContain("CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}");
 		expect(workflow).toContain("CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}");
 		expect(workflow).toContain("CI_DEV_MATRIX_NEXTEST: ${{ matrix.nextest }}");
@@ -78,6 +79,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("CI_DEV_MATRIX_IDENTITY: ${{ matrix.identity }}");
 		expect(workflow).toContain("Upload shard completion receipt");
 		expect(workflow).toContain("Validate canonical shard completion");
+		expect(workflow).toContain("Upload affected evidence receipt");
 		expect(workflow).toContain("--validate-shard-receipts");
 		expect(workflow).toContain("pi_natives.linux-x64-baseline.node");
 		expect(workflow).toContain("pi_natives.linux-x64-modern.node");
@@ -521,6 +523,39 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			CI_DEV_SHARD_RECEIPTS: receiptDir,
 		});
 		expect(receiptsValid.exitCode).toBe(0);
+		const hasNative = String(plan.tasks.some(task => task.capabilities.nativeProducer));
+		const hasTasks = String(plan.tasks.some(task => !task.capabilities.nativeProducer));
+		const aggregateValid = await runScript(["--validate-aggregate"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+			CI_DEV_PLAN_RESULT: "success",
+			CI_DEV_NATIVE_RESULT: hasNative === "true" ? "success" : "skipped",
+			CI_DEV_SHARDS_RESULT: hasTasks === "true" ? "success" : "skipped",
+			CI_DEV_HAS_NATIVE: hasNative,
+			CI_DEV_HAS_TASKS: hasTasks,
+			CI_DEV_WINDOWS_DOCTOR_RESULT: "skipped",
+			CI_DEV_WINDOWS_DOCTOR_REQUIRED: "false",
+		});
+		expect(aggregateValid.exitCode).toBe(0);
+		const evidencePath = path.join(repoRoot, ".ci-dev-affected-evidence.json");
+		const evidenceReceiptPath = path.join(repoRoot, ".ci-dev-affected-evidence.receipt.json");
+		const evidenceJson = await Bun.file(evidencePath).text();
+		const evidenceSha256 = new Bun.CryptoHasher("sha256").update(evidenceJson).digest("hex");
+		const evidenceReceipt = JSON.parse(await Bun.file(evidenceReceiptPath).text()) as {
+			evidencePath: string;
+			evidenceSha256: string;
+		};
+		expect(evidenceReceipt).toMatchObject({
+			evidencePath: ".ci-dev-affected-evidence.json",
+			evidenceSha256,
+		});
+		expect(evidenceJson).not.toContain(evidenceSha256);
+		const evidence = JSON.parse(evidenceJson) as { childEvidence: Array<{ path: string; sha256: string }> };
+		expect(evidence.childEvidence.some(child => child.path.endsWith("plan.json") && child.sha256 === digest)).toBe(true);
+		await fs.rm(evidencePath, { force: true });
+		await fs.rm(evidenceReceiptPath, { force: true });
 		await fs.rm(path.join(receiptDir, "0.json"));
 		const receiptMissing = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
 			CI_DEV_AFFECTED_PLAN: planFile,

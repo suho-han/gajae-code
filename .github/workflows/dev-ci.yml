@@ -351,6 +351,17 @@ jobs:
           CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
           CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
         run: bun scripts/ci-dev-affected.ts --validate-aggregate
+      - name: Upload affected evidence receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-affected-evidence-${{ github.run_id }}
+          path: |
+            .ci-dev-affected-evidence.json
+            .ci-dev-affected-evidence.receipt.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}

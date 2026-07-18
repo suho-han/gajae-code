@@ -1290,6 +1290,62 @@ export function validateAffectedAggregate(results: AffectedAggregateResults): vo
 	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
 }
 
+function sha256Text(value: string): string {
+	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
+}
+
+async function fileSha256(filePath: string): Promise<string> {
+	return sha256Text(await Bun.file(filePath).text());
+}
+
+async function listChildEvidenceFiles(input: {
+	planFile: string;
+	shardReceiptDir: string;
+	hasTasks: boolean;
+}): Promise<Array<{ path: string; sha256: string }>> {
+	const files = [{ path: path.relative(repoRoot, path.resolve(repoRoot, input.planFile)) || input.planFile, sha256: await fileSha256(path.resolve(repoRoot, input.planFile)) }];
+	if (!input.hasTasks) return files;
+	for await (const entry of new Bun.Glob("*.json").scan({ cwd: input.shardReceiptDir })) {
+		const filePath = path.join(input.shardReceiptDir, entry);
+		files.push({ path: path.relative(repoRoot, filePath) || filePath, sha256: await fileSha256(filePath) });
+	}
+	return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+async function writeAffectedEvidence(input: {
+	results: AffectedAggregateResults;
+	tasks: readonly Task[];
+}): Promise<void> {
+	const planFile = Bun.env.CI_DEV_AFFECTED_PLAN?.trim() || ".ci-dev-affected-plan.json";
+	const shardReceiptDir = path.resolve(repoRoot, Bun.env.CI_DEV_SHARD_RECEIPTS?.trim() || ".ci-dev-shard-receipts");
+	const evidencePath = path.join(repoRoot, ".ci-dev-affected-evidence.json");
+	const receiptPath = path.join(repoRoot, ".ci-dev-affected-evidence.receipt.json");
+	const sourceSha = Bun.env.CI_DEV_PLAN_SOURCE_SHA?.trim() || Bun.env.CI_DEV_SOURCE_SHA?.trim() || "";
+	const evidence = {
+		schemaVersion: 1,
+		sourceSha,
+		planDigest: Bun.env.CI_DEV_PLAN_DIGEST?.trim() || "",
+		results: input.results,
+		taskIdentities: input.tasks.map(task => ({ key: task.key, identity: canonicalTaskIdentity(task) })),
+		childEvidence: await listChildEvidenceFiles({
+			planFile,
+			shardReceiptDir,
+			hasTasks: input.results.hasTasks === "true",
+		}),
+	};
+	const evidenceJson = `${JSON.stringify(evidence)}\n`;
+	const evidenceSha256 = sha256Text(evidenceJson);
+	const receipt = {
+		schemaVersion: 1,
+		subject: "ci-dev-affected-evidence",
+		evidencePath: path.relative(repoRoot, evidencePath),
+		evidenceSha256,
+		sourceSha,
+	};
+	await Bun.write(evidencePath, evidenceJson);
+	await Bun.write(receiptPath, `${JSON.stringify(receipt)}\n`);
+}
+
 async function validateAggregate(): Promise<void> {
 	const results: AffectedAggregateResults = {
 		plan: Bun.env.CI_DEV_PLAN_RESULT?.trim() || "",
@@ -1315,6 +1371,7 @@ async function validateAggregate(): Promise<void> {
 	if (results.hasNative !== expectedHasNative || results.hasTasks !== expectedHasTasks) {
 		throw new Error("affected-plan-invalid: planner flags do not match canonical plan");
 	}
+	await writeAffectedEvidence({ results, tasks });
 	console.log("Affected path validation: all required shards passed");
 }
 
