@@ -69,6 +69,7 @@ __pycache__/
 .pytest_cache/
 
 # Scratch files
+PR_REVIEW_MEMO_*.md
 syntax.jsonl
 out.jsonl
 out.html
