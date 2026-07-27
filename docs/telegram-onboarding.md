@@ -308,8 +308,8 @@ the bundled `gjc notify setup` onboarding path is private-chat only.
 The managed daemon can render:
 
 - session identity headers;
-- context updates;
-- live/finalized assistant output;
+- context updates in `/verbose` mode;
+- settled assistant output in `/lean` mode, and every assistant tool-turn in `/verbose` mode;
 - image attachments;
 - ask prompts with inline buttons;
 - activity/typing indicators;

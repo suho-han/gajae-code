@@ -128,7 +128,7 @@ async function setup(
 	return { handlers, ctx, frames, ws, token, sid };
 }
 
-test("assistant text preceding an ask is flushed before the ask and not duplicated at turn_end", async () => {
+test("lean notifications flush ask lead-ins immediately and final assistant text only at agent_end", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
 	try {
@@ -172,6 +172,29 @@ test("assistant text preceding an ask is flushed before the ask and not duplicat
 		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
 		await waitFor(() => turnStreams().length === 2, 3000, "settled turn_stream at idle");
 		expect(turnStreams()[1]!.text).toContain("All done.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("verbose notifications still mirror each assistant tool-turn at turn_end", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const configUpdates = () => frames.filter(f => f.type === "config_update");
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "verbose" }));
+		await waitFor(() => configUpdates().some(f => f.verbosity === "verbose"), 3000, "verbose config_update");
+
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Intermediate result." } },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "verbose turn_stream");
+		expect(turnStreams()[0]!.text).toContain("Intermediate result.");
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
