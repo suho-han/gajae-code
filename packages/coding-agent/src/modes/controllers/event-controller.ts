@@ -23,6 +23,7 @@ import type { AgentSessionEvent } from "../../session/agent-session";
 import { type CustomMessage, isSilentAbort, readPendingDisplayTag } from "../../session/messages";
 import { transferSessionMessageIdentity } from "../../session/session-manager";
 import type { ResolveToolDetails } from "../../tools/resolve";
+import * as cmuxWorkspace from "../../utils/cmux-workspace";
 import type { IrcObservationRecord } from "../irc-observation-ledger";
 import { interruptHint } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
@@ -1063,10 +1064,12 @@ export class EventController {
 		return lastAssistant?.usage ? calculatePromptTokens(lastAssistant.usage) : 0;
 	}
 
-	#runCompletionNotifyCommand(payload: CompletionNotifyPayload): void {
+	#getCompletionNotifyCommand(): string | undefined {
 		const command = settings.getGlobal("completion.notifyCommand")?.trim();
-		if (!command) return;
+		return command || undefined;
+	}
 
+	#runCompletionNotifyCommand(payload: CompletionNotifyPayload, command: string): void {
 		try {
 			const proc = Bun.spawn(completionNotifyShellCommand(command), {
 				cwd: payload.cwd,
@@ -1130,9 +1133,23 @@ export class EventController {
 			lastAssistantMessage: summary,
 			stopReason: last?.stopReason,
 		};
+		const completionNotifyCommand = this.#getCompletionNotifyCommand();
+
 		ringTerminalBell("complete");
 		if (isBackgrounded) TERMINAL.sendNotification(title);
-		this.#runCompletionNotifyCommand(payload);
+		if (completionNotifyCommand) {
+			this.#runCompletionNotifyCommand(payload, completionNotifyCommand);
+		} else {
+			void cmuxWorkspace
+				.sendCmuxNotification({
+					title: "Complete",
+					subtitle: sessionName || undefined,
+					body: "Agent turn complete",
+				})
+				.catch(error => {
+					logger.debug("cmux completion notification failed", { error: String(error) });
+				});
+		}
 	}
 
 	async handleBackgroundEvent(event: AgentSessionEvent): Promise<void> {

@@ -1,14 +1,27 @@
 import { logger } from "@gajae-code/utils";
 
 const CMUX_COMMAND = "cmux";
-const CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID";
+export const CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID";
+export const CMUX_SURFACE_ID_ENV = "CMUX_SURFACE_ID";
 const CMUX_NO_RENAME_ENV = "GJC_NO_CMUX_RENAME";
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 const CMUX_WORKSPACE_TITLE_PREFIX = "GJC: ";
 const CMUX_WORKSPACE_RENAME_TIMEOUT_MS = 1500;
 const CMUX_WORKSPACE_LIST_TIMEOUT_MS = 1500;
+const CMUX_NOTIFY_TIMEOUT_MS = 1500;
+const CMUX_NOTIFICATION_TEXT_MAX = 240;
 
 export interface CmuxWorkspaceRenameCommand {
+	command: string;
+	args: string[];
+}
+export interface CmuxNotificationPayload {
+	title: string;
+	subtitle?: string;
+	body?: string;
+}
+
+export interface CmuxNotifyCommand {
 	command: string;
 	args: string[];
 }
@@ -60,6 +73,40 @@ export function sanitizeCmuxWorkspaceTitle(title: string | undefined): string | 
 	if (!title) return undefined;
 	const sanitized = title.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim();
 	return sanitized || undefined;
+}
+export function sanitizeCmuxNotificationText(
+	value: string | undefined,
+	max = CMUX_NOTIFICATION_TEXT_MAX,
+): string | undefined {
+	if (!value) return undefined;
+	const sanitized = value.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim();
+	if (!sanitized || max <= 0) return undefined;
+	const trimmed = sanitized.length > max ? sanitized.slice(0, max).trimEnd() : sanitized;
+	return trimmed || undefined;
+}
+
+export function buildCmuxNotifyCommand(
+	payload: CmuxNotificationPayload,
+	env: NodeJS.ProcessEnv = process.env,
+): CmuxNotifyCommand | null {
+	const surfaceId = env[CMUX_SURFACE_ID_ENV]?.trim();
+	const workspaceId = env[CMUX_WORKSPACE_ID_ENV]?.trim();
+	const targetArgs = surfaceId ? ["--surface", surfaceId] : workspaceId ? ["--workspace", workspaceId] : null;
+	if (!targetArgs) return null;
+
+	const title = sanitizeCmuxNotificationText(payload.title);
+	if (!title) return null;
+
+	const args = ["notify", ...targetArgs, "--title", title];
+	const subtitle = sanitizeCmuxNotificationText(payload.subtitle);
+	if (subtitle) args.push("--subtitle", subtitle);
+	const body = sanitizeCmuxNotificationText(payload.body);
+	if (body) args.push("--body", body);
+
+	return {
+		command: CMUX_COMMAND,
+		args,
+	};
 }
 
 export function formatCmuxWorkspaceTitle(title: string | undefined): string | undefined {
@@ -146,13 +193,69 @@ async function defaultReadOwnership(
 			} catch {}
 		}, CMUX_WORKSPACE_LIST_TIMEOUT_MS);
 		timer.unref?.();
-		const text = await new Response(proc.stdout).text();
-		await proc.exited;
-		clearTimeout(timer);
-		return parseCmuxWorkspaceOwnership(text, workspaceId);
+		try {
+			const text = await new Response(proc.stdout).text();
+			await proc.exited;
+			return parseCmuxWorkspaceOwnership(text, workspaceId);
+		} finally {
+			clearTimeout(timer);
+		}
 	} catch (error) {
 		logger.debug("cmux workspace list failed", { error: String(error) });
 		return null;
+	}
+}
+export async function sendCmuxNotification(
+	payload: CmuxNotificationPayload,
+	options: {
+		env?: NodeJS.ProcessEnv;
+		which?: (command: string) => string | null;
+		spawn?: (
+			command: string[],
+			options: { env: NodeJS.ProcessEnv; stdin: "ignore"; stdout: "ignore"; stderr: "ignore" },
+		) => CmuxWorkspaceRenameProcess;
+	} = {},
+): Promise<void> {
+	const env = options.env ?? process.env;
+	const plan = buildCmuxNotifyCommand(payload, env);
+	if (!plan) return;
+
+	const which = options.which ?? Bun.which;
+	let resolvedCommand: string | null;
+	try {
+		resolvedCommand = which(plan.command);
+	} catch (error) {
+		logger.debug("cmux notify command lookup failed", { error: String(error) });
+		return;
+	}
+	if (!resolvedCommand) return;
+
+	const spawn = options.spawn ?? defaultSpawn;
+	try {
+		const proc = spawn([resolvedCommand, ...plan.args], {
+			env: { ...env, CMUX_QUIET: "1" },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		proc.unref();
+		const timer = setTimeout(() => {
+			try {
+				proc.kill();
+			} catch {}
+		}, CMUX_NOTIFY_TIMEOUT_MS);
+		timer.unref?.();
+		void proc.exited
+			.then(exitCode => {
+				clearTimeout(timer);
+				if (exitCode !== 0) logger.debug("cmux notify exited non-zero", { exitCode });
+			})
+			.catch(error => {
+				clearTimeout(timer);
+				logger.debug("cmux notify failed", { error: String(error) });
+			});
+	} catch (error) {
+		logger.debug("cmux notify failed to start", { error: String(error) });
 	}
 }
 

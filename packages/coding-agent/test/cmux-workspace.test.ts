@@ -1,10 +1,13 @@
-import { describe, expect, it, vi } from "bun:test";
+import { describe, expect, it, type Mock, vi } from "bun:test";
 import {
+	buildCmuxNotifyCommand,
 	buildCmuxWorkspaceRenameCommand,
 	type CmuxWorkspaceOwnership,
 	formatCmuxWorkspaceTitle,
 	parseCmuxWorkspaceOwnership,
+	sanitizeCmuxNotificationText,
 	sanitizeCmuxWorkspaceTitle,
+	sendCmuxNotification,
 	shouldRenameCmuxWorkspace,
 	syncCmuxWorkspaceTitle,
 } from "../src/utils/cmux-workspace";
@@ -20,7 +23,219 @@ const LIST_JSON = JSON.stringify({
 		{ id: "CCCC-9999", ref: "workspace:9", title: "~/dev/x", has_custom_title: false },
 	],
 });
+function pendingExitProcess(): {
+	exited: Promise<number>;
+	resolve: (exitCode: number) => void;
+	reject: (error: Error) => void;
+	kill: Mock<() => void>;
+	unref: Mock<() => void>;
+} {
+	const deferred = Promise.withResolvers<number>();
+	return {
+		exited: deferred.promise,
+		resolve: deferred.resolve,
+		reject: deferred.reject,
+		kill: vi.fn(() => {}),
+		unref: vi.fn(() => {}),
+	};
+}
 
+describe("cmux notifications", () => {
+	it("builds exact argv with surface priority", () => {
+		expect(
+			buildCmuxNotifyCommand(
+				{ title: "Done", subtitle: "Story G001", body: "Finished" },
+				cmuxEnv("workspace-123", { CMUX_SURFACE_ID: "surface-456" }),
+			),
+		).toEqual({
+			command: "cmux",
+			args: [
+				"notify",
+				"--surface",
+				"surface-456",
+				"--title",
+				"Done",
+				"--subtitle",
+				"Story G001",
+				"--body",
+				"Finished",
+			],
+		});
+	});
+
+	it("falls back to workspace argv when no surface id is present", () => {
+		expect(buildCmuxNotifyCommand({ title: "Done" }, cmuxEnv("workspace-123"))).toEqual({
+			command: "cmux",
+			args: ["notify", "--workspace", "workspace-123", "--title", "Done"],
+		});
+	});
+
+	it("returns null with no cmux target", () => {
+		expect(buildCmuxNotifyCommand({ title: "Done" }, {} as NodeJS.ProcessEnv)).toBeNull();
+	});
+
+	it("send skips before lookup with no cmux target", async () => {
+		let lookedUp = false;
+		let spawned = false;
+		await sendCmuxNotification(
+			{ title: "Done" },
+			{
+				env: {} as NodeJS.ProcessEnv,
+				which: () => {
+					lookedUp = true;
+					return "/opt/bin/cmux";
+				},
+				spawn: () => {
+					spawned = true;
+					return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
+				},
+			},
+		);
+		expect(lookedUp).toBe(false);
+		expect(spawned).toBe(false);
+	});
+
+	it("sanitizes notification metadata", () => {
+		expect(sanitizeCmuxNotificationText("  Done\u0001\u001b\n\t now  ")).toBe("Done now");
+		expect(sanitizeCmuxNotificationText("abcdef", 4)).toBe("abcd");
+		expect(sanitizeCmuxNotificationText("\n\t")).toBeUndefined();
+	});
+
+	it("skips sanitized empty title", () => {
+		expect(buildCmuxNotifyCommand({ title: "\u0001\n\t" }, cmuxEnv("workspace-123"))).toBeNull();
+	});
+
+	it("skips when cmux lookup fails or is unavailable", async () => {
+		let spawned = false;
+		await sendCmuxNotification(
+			{ title: "Done" },
+			{
+				env: cmuxEnv("workspace-123"),
+				which: () => null,
+				spawn: () => {
+					spawned = true;
+					return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
+				},
+			},
+		);
+		expect(spawned).toBe(false);
+
+		await sendCmuxNotification(
+			{ title: "Done" },
+			{
+				env: cmuxEnv("workspace-123"),
+				which: () => {
+					throw new Error("lookup failed");
+				},
+				spawn: () => {
+					spawned = true;
+					return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
+				},
+			},
+		);
+		expect(spawned).toBe(false);
+	});
+
+	it("spawns the resolved command with CMUX_QUIET and ignored stdio", async () => {
+		const proc = pendingExitProcess();
+		const calls: string[][] = [];
+		const envs: NodeJS.ProcessEnv[] = [];
+
+		await sendCmuxNotification(
+			{ title: "Done", subtitle: "Ready" },
+			{
+				env: cmuxEnv("workspace-123", { CMUX_SURFACE_ID: "surface-456" }),
+				which: command => (command === "cmux" ? "/opt/bin/cmux" : null),
+				spawn: (command, options) => {
+					calls.push(command);
+					envs.push(options.env);
+					expect(options.stdin).toBe("ignore");
+					expect(options.stdout).toBe("ignore");
+					expect(options.stderr).toBe("ignore");
+					return proc;
+				},
+			},
+		);
+
+		expect(calls).toEqual([
+			["/opt/bin/cmux", "notify", "--surface", "surface-456", "--title", "Done", "--subtitle", "Ready"],
+		]);
+		expect(envs[0]?.CMUX_QUIET).toBe("1");
+		expect(envs[0]?.CMUX_SURFACE_ID).toBe("surface-456");
+		expect(proc.unref).toHaveBeenCalledTimes(1);
+		expect(proc.kill).not.toHaveBeenCalled();
+		proc.resolve(0);
+		await Promise.resolve();
+	});
+
+	it("kills the notification process on timeout", async () => {
+		vi.useFakeTimers();
+		try {
+			const proc = pendingExitProcess();
+			await sendCmuxNotification(
+				{ title: "Done" },
+				{
+					env: cmuxEnv("workspace-123"),
+					which: () => "/opt/bin/cmux",
+					spawn: () => proc,
+				},
+			);
+
+			vi.advanceTimersByTime(1499);
+			expect(proc.kill).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(1);
+			expect(proc.kill).toHaveBeenCalledTimes(1);
+			proc.resolve(0);
+			await Promise.resolve();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("skips cleanly when spawn throws", async () => {
+		await expect(
+			sendCmuxNotification(
+				{ title: "Done" },
+				{
+					env: cmuxEnv("workspace-123"),
+					which: () => "/opt/bin/cmux",
+					spawn: () => {
+						throw new Error("spawn failed");
+					},
+				},
+			),
+		).resolves.toBeUndefined();
+	});
+
+	it("handles rejected and non-zero notification exits", async () => {
+		const rejected = pendingExitProcess();
+		await sendCmuxNotification(
+			{ title: "Done" },
+			{
+				env: cmuxEnv("workspace-123"),
+				which: () => "/opt/bin/cmux",
+				spawn: () => rejected,
+			},
+		);
+		rejected.reject(new Error("exit failed"));
+		await Promise.resolve();
+
+		const nonZero = pendingExitProcess();
+		await sendCmuxNotification(
+			{ title: "Done" },
+			{
+				env: cmuxEnv("workspace-123"),
+				which: () => "/opt/bin/cmux",
+				spawn: () => nonZero,
+			},
+		);
+		nonZero.resolve(2);
+		await Promise.resolve();
+
+		expect(rejected.kill).not.toHaveBeenCalled();
+		expect(nonZero.kill).not.toHaveBeenCalled();
+	});
+});
 describe("cmux workspace title sync", () => {
 	it("builds an explicit workspace rename command with the GJC prefix", () => {
 		expect(buildCmuxWorkspaceRenameCommand("Investigate Resolver", cmuxEnv())).toEqual({

@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -9,6 +9,7 @@ import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/
 import type { AskAnswerRequest, AskAnswerSource, AskRemoteReceipt, ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool, askSchema, askToolRenderer } from "@gajae-code/coding-agent/tools/ask";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
+import { TERMINAL } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
@@ -69,12 +70,32 @@ function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
+const originalCmuxSurfaceId = process.env.CMUX_SURFACE_ID;
+const originalCmuxWorkspaceId = process.env.CMUX_WORKSPACE_ID;
+
+function clearCmuxEnvForTest(): void {
+	delete process.env.CMUX_SURFACE_ID;
+	delete process.env.CMUX_WORKSPACE_ID;
+}
+
+function restoreCmuxEnvAfterTest(): void {
+	if (originalCmuxSurfaceId === undefined) delete process.env.CMUX_SURFACE_ID;
+	else process.env.CMUX_SURFACE_ID = originalCmuxSurfaceId;
+	if (originalCmuxWorkspaceId === undefined) delete process.env.CMUX_WORKSPACE_ID;
+	else process.env.CMUX_WORKSPACE_ID = originalCmuxWorkspaceId;
+}
+
+beforeEach(() => {
+	clearCmuxEnvForTest();
+});
+
 beforeAll(async () => {
 	await initTheme(false);
 });
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	restoreCmuxEnvAfterTest();
 });
 
 function deepInterviewMeta() {
@@ -89,6 +110,191 @@ function singleDeepInterviewQuestion() {
 		deepInterview: deepInterviewMeta(),
 	};
 }
+
+async function withCmuxEnv<T>(env: Record<string, string>, run: () => Promise<T>): Promise<T> {
+	const previousSurfaceId = process.env.CMUX_SURFACE_ID;
+	const previousWorkspaceId = process.env.CMUX_WORKSPACE_ID;
+	delete process.env.CMUX_SURFACE_ID;
+	delete process.env.CMUX_WORKSPACE_ID;
+	for (const [key, value] of Object.entries(env)) {
+		process.env[key] = value;
+	}
+	try {
+		return await run();
+	} finally {
+		if (previousSurfaceId === undefined) delete process.env.CMUX_SURFACE_ID;
+		else process.env.CMUX_SURFACE_ID = previousSurfaceId;
+		if (previousWorkspaceId === undefined) delete process.env.CMUX_WORKSPACE_ID;
+		else process.env.CMUX_WORKSPACE_ID = previousWorkspaceId;
+	}
+}
+
+describe("AskTool notifications", () => {
+	it("sends terminal and metadata-only cmux notifications when ask.notify is on", async () => {
+		await withCmuxEnv({ CMUX_SURFACE_ID: "surface-ask", CMUX_WORKSPACE_ID: "workspace-ignored" }, async () => {
+			const terminalNotify = spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			const spawnedCommands: string[][] = [];
+			const unref = vi.fn(() => {});
+			const kill = vi.fn(() => {});
+			const which = spyOn(Bun, "which").mockImplementation(command =>
+				command === "cmux" ? "/usr/local/bin/cmux" : null,
+			);
+			const spawn = spyOn(Bun, "spawn").mockImplementation(commandInput => {
+				const command = Array.isArray(commandInput) ? commandInput : commandInput.cmd;
+				spawnedCommands.push([...command]);
+				return { exited: Promise.resolve(0), kill, unref } as never;
+			});
+			const tool = new AskTool(createSession());
+			const context = createContext({
+				select: async () => "Yes",
+			});
+
+			const result = await tool.execute(
+				"call-notify-on",
+				{
+					questions: [
+						{
+							id: "approval-secret",
+							question: "Approve workflow gate contents with transcript?",
+							options: [{ label: "Yes" }, { label: "No" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Yes" });
+			expect(terminalNotify).toHaveBeenCalledWith("Waiting for input");
+			expect(which).toHaveBeenCalledWith("cmux");
+			expect(spawn).toHaveBeenCalledTimes(1);
+			expect(spawnedCommands).toEqual([
+				[
+					"/usr/local/bin/cmux",
+					"notify",
+					"--surface",
+					"surface-ask",
+					"--title",
+					"Waiting for input",
+					"--body",
+					"GJC is waiting for your response",
+				],
+			]);
+			const serializedCommand = spawnedCommands[0]?.join("\u0000") ?? "";
+			expect(serializedCommand).not.toContain("Approve workflow gate contents");
+			expect(serializedCommand).not.toContain("transcript");
+			expect(serializedCommand).not.toContain("Yes");
+			expect(serializedCommand).not.toContain("No");
+			expect(unref).toHaveBeenCalledTimes(1);
+			expect(kill).not.toHaveBeenCalled();
+		});
+	});
+
+	it("skips terminal and cmux notifications when ask.notify is off while preserving the ask flow", async () => {
+		await withCmuxEnv({ CMUX_SURFACE_ID: "surface-off" }, async () => {
+			const settings = Settings.isolated();
+			settings.set("ask.notify", "off");
+			const terminalNotify = spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			const which = spyOn(Bun, "which").mockImplementation(() => "/usr/local/bin/cmux");
+			const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+				return { exited: Promise.resolve(0), kill: vi.fn(() => {}), unref: vi.fn(() => {}) } as never;
+			});
+			const tool = new AskTool(createSession({ settings }));
+			const context = createContext({
+				select: async () => "No",
+			});
+
+			const result = await tool.execute(
+				"call-notify-off",
+				{
+					questions: [
+						{
+							id: "confirm",
+							question: "Proceed?",
+							options: [{ label: "Yes" }, { label: "No" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: No" });
+			expect(terminalNotify).not.toHaveBeenCalled();
+			expect(which).not.toHaveBeenCalled();
+			expect(spawn).not.toHaveBeenCalled();
+		});
+	});
+
+	it("preserves the ask flow when cmux is absent", async () => {
+		await withCmuxEnv({ CMUX_WORKSPACE_ID: "workspace-ask" }, async () => {
+			spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			const which = spyOn(Bun, "which").mockImplementation(() => null);
+			const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+				return { exited: Promise.resolve(0), kill: vi.fn(() => {}), unref: vi.fn(() => {}) } as never;
+			});
+			const tool = new AskTool(createSession());
+			const context = createContext({
+				select: async () => "Continue",
+			});
+
+			const result = await tool.execute(
+				"call-cmux-absent",
+				{
+					questions: [
+						{
+							id: "continue",
+							question: "Continue despite missing cmux?",
+							options: [{ label: "Continue" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Continue" });
+			expect(which).toHaveBeenCalledWith("cmux");
+			expect(spawn).not.toHaveBeenCalled();
+		});
+	});
+
+	it("preserves the ask flow when cmux notification spawn fails", async () => {
+		await withCmuxEnv({ CMUX_WORKSPACE_ID: "workspace-spawn-fails" }, async () => {
+			spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			spyOn(Bun, "which").mockImplementation(() => "/usr/local/bin/cmux");
+			const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+				throw new Error("spawn failed");
+			});
+			const tool = new AskTool(createSession());
+			const context = createContext({
+				select: async () => "Use fallback",
+			});
+
+			const result = await tool.execute(
+				"call-cmux-spawn-fails",
+				{
+					questions: [
+						{
+							id: "fallback",
+							question: "Use fallback?",
+							options: [{ label: "Use fallback" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Use fallback" });
+			expect(spawn).toHaveBeenCalledTimes(1);
+		});
+	});
+});
 
 describe("AskTool cancellation", () => {
 	it("aborts the turn when the user cancels selection", async () => {

@@ -52,6 +52,7 @@ import {
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
+import { sendCmuxNotification } from "../utils/cmux-workspace";
 import type {
 	AskAnswerRequest,
 	AskRemoteControl,
@@ -61,7 +62,6 @@ import type {
 	AskSettlementResult,
 	ToolSession,
 } from ".";
-
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
@@ -1193,6 +1193,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const method = this.session.settings.get("ask.notify");
 		if (method === "off") return;
 		TERMINAL.sendNotification("Waiting for input");
+		void sendCmuxNotification({ title: "Waiting for input", body: "GJC is waiting for your response" });
 	}
 
 	/**
