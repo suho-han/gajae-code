@@ -183,10 +183,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
-		let continuedCalled = false;
 		const continued = Promise.withResolvers<void>();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			continuedCalled = true;
 			continued.resolve();
 		});
 

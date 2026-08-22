@@ -1522,7 +1522,8 @@ function waitForTurnStateChange(namespaceDir: string, turn: TurnRecord, timeoutM
 	for (const [dir, filenames] of watchedFiles) {
 		try {
 			const watcher = nodeFs.watch(dir, (_eventType, filename) => {
-				if (typeof filename === "string" && filenames.has(filename)) finish();
+				// Filesystem watchers may omit the filename for rename events.
+				if (filename === undefined || (typeof filename === "string" && filenames.has(filename))) finish();
 			});
 			watchers.push(watcher);
 		} catch {
@@ -1561,7 +1562,8 @@ async function waitForCoordinatorEvents(namespaceDir: string, timeoutMs: number)
 					if (filename === "event-journal.jsonl" || filename === "latest-seq.json") finish();
 					return;
 				}
-				if (typeof filename === "string" && filename.endsWith(".json")) finish();
+				// Filesystem watchers may omit the filename for rename events.
+				if (filename === undefined || (typeof filename === "string" && filename.endsWith(".json"))) finish();
 			});
 			watchers.push(watcher);
 		} catch {
