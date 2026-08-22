@@ -746,11 +746,6 @@ describe("Coordinator MCP server protocol", () => {
 			allow_mutation: true,
 		});
 		const turnId = sent.turn_id as string;
-		const ackWatch = server.callTool("gjc_coordinator_watch_events", {
-			after_seq: 0,
-			event_types: ["turn.acknowledged"],
-			timeout_ms: 5000,
-		});
 		const sessionStatePath = path.join(
 			stateRoot,
 			"local",
@@ -774,9 +769,16 @@ describe("Coordinator MCP server protocol", () => {
 				reason: "turn_start",
 			}),
 		);
-		await server.callTool("gjc_coordinator_read_status", {
+		await server.callTool("gjc_coordinator_read_turn", {
 			session_id: "omx-issue-3059-state-root-resolution",
+			turn_id: turnId,
 		});
+		const ackWatch = server.callTool("gjc_coordinator_watch_events", {
+			after_seq: 0,
+			event_types: ["turn.acknowledged"],
+			timeout_ms: 5000,
+		});
+		await Bun.sleep(25);
 		const acknowledged = await ackWatch;
 		expect(acknowledged).toMatchObject({ ok: true, timed_out: false });
 		expect(acknowledged.events as Array<{ kind: string; turn_id?: string }>).toContainEqual(
