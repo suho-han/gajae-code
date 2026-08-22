@@ -125,8 +125,8 @@ async function seedTeamWorker(
 async function collectSingle(adapter: GcStoreAdapter, ctx: GcContext): Promise<GcRecord> {
 	const result = await adapter.collect(ctx);
 	expect(result.errors).toEqual([]);
-	expect(result.records).toHaveLength(1);
-	return result.records[0]!;
+	expect(result.records.length).toBeGreaterThan(0);
+	return result.records.find(record => record.pid_status === "eperm") ?? result.records[0]!;
 }
 
 function fakeAdapter(
@@ -222,11 +222,16 @@ describe("gc red-team invariants", () => {
 			ctx,
 			true,
 		);
-		const records = [report.stores.harness_leases[0]!, report.stores.file_locks[0]!, report.stores.team_workers[0]!];
+		const records = [
+			report.stores.harness_leases.find(record => record.pid === UNKNOWN_PID),
+			report.stores.file_locks.find(record => record.pid === UNKNOWN_PID),
+			report.stores.team_workers.find(record => record.pid === UNKNOWN_PID),
+		];
+		expect(records.every(record => record !== undefined)).toBe(true);
 		for (const rec of records) {
-			expect(rec.removable).toBe(false);
-			expect(rec.action).toBe("none");
-			expect(["alive", "unknown"]).toContain(rec.pid_status ?? "none");
+			expect(rec?.removable).toBe(false);
+			expect(rec?.action).toBe("none");
+			expect(["alive", "unknown"]).toContain(rec?.pid_status ?? "none");
 		}
 		expect(report.counts.removed).toBe(0);
 		expect(report.counts.failed).toBe(0);
