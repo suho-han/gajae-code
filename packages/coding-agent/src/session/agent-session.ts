@@ -18,6 +18,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import {
+	AdaptiveCompactionTracker,
 	type AfterToolCallContext,
 	type AfterToolCallResult,
 	type Agent,
@@ -988,6 +989,7 @@ export class AgentSession {
 	// Compaction state
 	#compactionAbortController: AbortController | undefined = undefined;
 	#autoCompactionAbortController: AbortController | undefined = undefined;
+	#adaptiveCompactionTracker = new AdaptiveCompactionTracker();
 	#resourceSampler: () => EmergencyCompactionSample = () => this.#defaultResourceSample();
 	#prePromptContextCheckPromise: Promise<void> | undefined = undefined;
 
@@ -7116,12 +7118,15 @@ export class AgentSession {
 		// which breaks the provider prompt-cache prefix mid-epoch. Only prune at a
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
+		const adaptiveCompactionSettings = this.#recordAdaptiveCompactionCall(contextTokens, compactionSettings);
+		if (!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens))
+			return;
 		const pruneResult = await this.#pruneToolOutputs();
 		if (pruneResult) {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+		const prunedCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
+		if (shouldCompact(contextTokens, contextWindow, prunedCompactionSettings, autoCompactionOutputReserveTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (!promoted) {
@@ -7202,18 +7207,39 @@ export class AgentSession {
 		// Model maxTokens is a capability ceiling, not a per-turn reservation.
 		// Auto maintenance should track actual context fullness.
 		const autoCompactionOutputReserveTokens = 0;
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
+		const adaptiveCompactionSettings = this.#recordAdaptiveCompactionCall(contextTokens, compactionSettings);
+		if (!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens))
+			return;
 
 		const pruneResult = await this.#pruneToolOutputs();
 		if (pruneResult) {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+		const prunedCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
+		if (shouldCompact(contextTokens, contextWindow, prunedCompactionSettings, autoCompactionOutputReserveTokens)) {
 			await this.#runAutoCompaction("threshold", false, false, {
 				continueAfterMaintenance: false,
 				deferHandoffMaintenance: false,
 			});
 		}
+	}
+
+	#recordAdaptiveCompactionCall<T extends { adaptive?: { enabled: boolean; turnWindow: number } }>(
+		contextTokens: number,
+		settings: T,
+	): T {
+		if (!settings.adaptive?.enabled) return settings;
+		this.#adaptiveCompactionTracker.setWindowMs(settings.adaptive.turnWindow * 60_000);
+		this.#adaptiveCompactionTracker.recordCall(contextTokens);
+		return this.#compactionSettingsWithAdaptiveState(settings);
+	}
+
+	#compactionSettingsWithAdaptiveState<T extends { adaptive?: { enabled: boolean } }>(settings: T): T {
+		if (!settings.adaptive?.enabled) return settings;
+		return {
+			...settings,
+			adaptiveState: this.#adaptiveCompactionTracker.decisionState(),
+		};
 	}
 
 	#assistantEndedWithSuccessfulYield(assistantMessage: AssistantMessage): boolean {
@@ -8384,6 +8410,9 @@ export class AgentSession {
 				preserveData,
 			);
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+			if (compactionSettings.adaptive?.enabled) {
+				this.#adaptiveCompactionTracker.recordCompact(tokensBefore);
+			}
 
 			const result: CompactionResult = {
 				summary,

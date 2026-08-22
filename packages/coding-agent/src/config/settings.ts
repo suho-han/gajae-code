@@ -425,7 +425,7 @@ export class Settings {
 		for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 			if (key.startsWith(`${prefix}.`)) {
 				const suffix = key.slice(prefix.length + 1);
-				result[suffix] = this.get(key);
+				setByPath(result, suffix.split("."), this.get(key));
 			}
 		}
 		return result as unknown as GroupTypeMap[G];
