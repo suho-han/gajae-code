@@ -168,6 +168,20 @@ function isWindowsSubsystemForLinux(): boolean {
 	return process.platform === "linux" && (!!$env.WSL_DISTRO_NAME || !!$env.WSL_INTEROP);
 }
 const STDOUT_ERROR_HANDLER_GRACE_MS = 250;
+const stdoutErrorHandlers = new Set<(err: Error) => void>();
+const dispatchStdoutError = (err: Error): void => {
+	for (const handler of stdoutErrorHandlers) handler(err);
+};
+
+function addStdoutErrorHandler(handler: (err: Error) => void): void {
+	if (stdoutErrorHandlers.size === 0) process.stdout.on("error", dispatchStdoutError);
+	stdoutErrorHandlers.add(handler);
+}
+
+function removeStdoutErrorHandler(handler: (err: Error) => void): void {
+	stdoutErrorHandlers.delete(handler);
+	if (stdoutErrorHandlers.size === 0) process.stdout.removeListener("error", dispatchStdoutError);
+}
 
 /**
  * Real terminal using process.stdin/stdout
@@ -243,7 +257,7 @@ export class ProcessTerminal implements Terminal {
 			this.#stdoutErrorHandler = (err: Error) => {
 				this.#markUnavailable(err, "stdout-error");
 			};
-			process.stdout.on("error", this.#stdoutErrorHandler);
+			addStdoutErrorHandler(this.#stdoutErrorHandler);
 		}
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
@@ -736,8 +750,7 @@ export class ProcessTerminal implements Terminal {
 		// of surfacing as uncaught exceptions that kill the tmux pane.
 		this.#stdoutErrorHandlerCleanupTimer = setTimeout(() => {
 			if (this.#stdoutErrorHandler) {
-				process.stdout.removeListener("error", this.#stdoutErrorHandler);
-				this.#stdoutErrorHandler = undefined;
+				removeStdoutErrorHandler(this.#stdoutErrorHandler);
 			}
 			this.#stdoutErrorHandlerCleanupTimer = undefined;
 		}, STDOUT_ERROR_HANDLER_GRACE_MS);
