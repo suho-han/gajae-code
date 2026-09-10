@@ -1,10 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- `GJC_TIMING` now measures the real cold start. The timing window opens at the first CLI statement (`cli:installRuntimeGlobals`, `cli:dispatch` spans), exposing the runtime-globals install, the macOS nofile preflight, and the launch command's module graph that previously escaped measurement because the window opened inside `main.ts`. `GJC_TIMING=x` boots interactive mode through the first transcript paint (`interactive:init` / `interactive:firstPaint` spans) before printing the tree and exiting, making the total a true time-to-first-render measure instead of a pre-TUI proxy.
 
 ### Added
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
+
 ### Fixed
 - `skill_discovery` zero-candidate results no longer pass as an empty catalog when the query itself filtered everything out. Query matching is conjunctive substring (every whitespace-separated term must appear in name/description/source/use-when, unless a term equals the exact skill name), so a single topic keyword that appears nowhere drops every skill; a query that matches nothing now carries a `notice` stating how many skills were scanned, the conjunctive-substring rule, and the retry guidance. The tool prompt and `query` schema description now document the semantics instead of implying relevance ranking, so a model can no longer answer "no such skill" from a filtered result. `discoverRuntimeSkills` results gained a `scanned` count backing the notice.
 - Headless ACP asks now abort their enclosing foreground turn when the remote client cancels the ask. Previously the ask tool rejected with a cancellation error without releasing foreground ownership, so the next client prompt could be rejected as already active.
