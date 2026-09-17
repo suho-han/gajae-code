@@ -36,26 +36,43 @@ console.log("ok");
 `;
 }
 
+// Each probe spawns a cold `bun -e` child that resolves the workspace module
+// graph; on slow CI runners that alone can exceed Bun's 5s default timeout.
+const SPAWN_PROBE_TIMEOUT_MS = 30_000;
+
 describe("startup imports", () => {
-	it("importing utils does not synchronously load winston or handlebars", async () => {
-		await expect(
-			runBunEval(importProbe("./packages/utils/src/index.ts", ["node_modules/winston", "node_modules/handlebars"]), {
-				GJC_CONFIG_DIR: `.gjc-startup-imports-${Date.now()}`,
-			}),
-		).resolves.toContain("ok");
-	});
+	it(
+		"importing utils does not synchronously load winston or handlebars",
+		async () => {
+			await expect(
+				runBunEval(
+					importProbe("./packages/utils/src/index.ts", ["node_modules/winston", "node_modules/handlebars"]),
+					{
+						GJC_CONFIG_DIR: `.gjc-startup-imports-${Date.now()}`,
+					},
+				),
+			).resolves.toContain("ok");
+		},
+		SPAWN_PROBE_TIMEOUT_MS,
+	);
 
-	it("importing the fetch tool does not synchronously load linkedom", async () => {
-		await expect(
-			runBunEval(importProbe("./packages/coding-agent/src/tools/fetch.ts", ["node_modules/linkedom"]), {
-				GJC_CONFIG_DIR: `.gjc-startup-imports-${Date.now()}`,
-			}),
-		).resolves.toContain("ok");
-	});
+	it(
+		"importing the fetch tool does not synchronously load linkedom",
+		async () => {
+			await expect(
+				runBunEval(importProbe("./packages/coding-agent/src/tools/fetch.ts", ["node_modules/linkedom"]), {
+					GJC_CONFIG_DIR: `.gjc-startup-imports-${Date.now()}`,
+				}),
+			).resolves.toContain("ok");
+		},
+		SPAWN_PROBE_TIMEOUT_MS,
+	);
 
-	it("buffers the first synchronous log write until winston transports are ready", async () => {
-		const logDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-logger-startup-"));
-		const source = `
+	it(
+		"buffers the first synchronous log write until winston transports are ready",
+		async () => {
+			const logDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-logger-startup-"));
+			const source = `
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "./packages/utils/src/index.ts";
@@ -81,8 +98,10 @@ while (Date.now() < deadline) {
 console.error(content || "no log content");
 process.exit(1);
 `;
-		const output = await runBunEval(source, { GJC_TEST_LOG_DIR: logDir });
-		expect(output).toContain("startup-first-line");
-		expect(output).toContain('"marker":"first"');
-	});
+			const output = await runBunEval(source, { GJC_TEST_LOG_DIR: logDir });
+			expect(output).toContain("startup-first-line");
+			expect(output).toContain('"marker":"first"');
+		},
+		SPAWN_PROBE_TIMEOUT_MS,
+	);
 });
