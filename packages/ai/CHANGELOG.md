@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Bumped the spoofed Claude Code fingerprint to `2.1.274` and the Gemini CLI version to `0.60.0` after the daily drift check flagged both behind upstream releases. Anthropic gates newer models behind a minimum client version, so a stale `claude-cli` version can surface as HTTP 400 on reachable models.
+
 ## [0.16.6] - 2026-09-07
 
 ## [0.16.5] - 2026-09-07
