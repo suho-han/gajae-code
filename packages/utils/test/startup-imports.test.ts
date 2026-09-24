@@ -40,6 +40,46 @@ console.log("ok");
 // graph; on slow CI runners that alone can exceed Bun's 5s default timeout.
 const SPAWN_PROBE_TIMEOUT_MS = 30_000;
 
+function fetchImportProbe(): string {
+	return `
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const cacheKeys = () => Object.keys(require.cache).map(key => key.replaceAll(String.fromCharCode(92), "/"));
+const registryLoaded = () => cacheKeys().some(key => key.endsWith("/web/scrapers/index.ts"));
+const linkedomLoaded = () => cacheKeys().some(key => key.includes("/node_modules/linkedom"));
+const fetchModule = await import("./packages/coding-agent/src/tools/fetch.ts");
+if (registryLoaded()) throw new Error("scraper registry was eagerly loaded with fetch.ts");
+if (linkedomLoaded()) throw new Error("linkedom was synchronously loaded with fetch.ts");
+
+let requests = 0;
+globalThis.fetch = async () => {
+	requests++;
+	return new Response(JSON.stringify({
+		title: "Startup import regression",
+		number: 5841,
+		state: "open",
+		user: { login: "test" },
+		created_at: "2026-09-23T00:00:00Z",
+		updated_at: "2026-09-23T00:00:00Z",
+		body: "Served by the local startup-import probe.",
+		labels: [],
+		comments: 0,
+		html_url: "https://github.com/gjc/startup-imports/issues/5841"
+	}), { status: 200, headers: { "content-type": "application/json" } });
+};
+const result = await fetchModule.fetchSpecialHandlerTestHooks.dispatch(
+	"https://github.com/gjc/startup-imports/issues/5841", 1, undefined, null
+);
+if (result?.method !== "github-issue" || !result.content.includes("# Startup import regression")) {
+	throw new Error("GitHub special handler did not execute after lazy registry load");
+}
+if (requests !== 1) throw new Error("GitHub handler made an unexpected number of requests");
+if (!registryLoaded()) throw new Error("special-handler dispatch did not load the scraper registry");
+if (linkedomLoaded()) throw new Error("special-handler dispatch synchronously loaded linkedom");
+console.log("ok");
+`;
+}
+
 describe("startup imports", () => {
 	it(
 		"importing utils does not synchronously load winston or handlebars",
@@ -57,10 +97,10 @@ describe("startup imports", () => {
 	);
 
 	it(
-		"importing the fetch tool does not synchronously load linkedom",
+		"fetch defers scraper handlers until dispatch while keeping linkedom lazy",
 		async () => {
 			await expect(
-				runBunEval(importProbe("./packages/coding-agent/src/tools/fetch.ts", ["node_modules/linkedom"]), {
+				runBunEval(fetchImportProbe(), {
 					GJC_CONFIG_DIR: `.gjc-startup-imports-${Date.now()}`,
 				}),
 			).resolves.toContain("ok");

@@ -29,7 +29,12 @@ import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
-import { activateModelProfile, ModelProfileCredentialError } from "./config/model-profile-activation";
+import {
+	activateModelProfile,
+	applyModelProfileRuntimeBindings,
+	ModelProfileCredentialError,
+} from "./config/model-profile-activation";
+import { UnknownModelProfileError } from "./config/model-profile-contract";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import {
 	parseModelString,
@@ -59,6 +64,9 @@ import type { SubmittedUserInput } from "./modes/types";
 import { applyCliRuntimeApiKeyOverride } from "./runtime-api-key";
 import { type CliCredentialSelector, parseCliCredentialSelector } from "./runtime-credential-selector";
 import type { MCPManager } from "./runtime-mcp";
+// Leaf path, not the barrel: the capability registry must stay out of the
+// runtime-mcp import graph that every root command would otherwise load.
+import { attachExactMcpControls } from "./runtime-mcp/redaction";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -460,35 +468,63 @@ type StartupModelProfileArgs = {
 	session: AgentSession;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
+	parsedArgs: Pick<Args, "continue" | "default" | "fork" | "model" | "mpreset" | "resume" | "thinking">;
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 	preferCachedModels?: boolean;
 	preferCachedDefaultProfile?: boolean;
 };
 
+function staleDefaultProfileMessage(error: UnknownModelProfileError, profileCatalogRefreshUnavailable = false): string {
+	const refreshNotice = profileCatalogRefreshUnavailable
+		? " The online profile catalog could not be refreshed; continuing with the last accepted catalog."
+		: "";
+	return `Configured modelProfile.default is stale: unknown model profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI. To clear it, remove modelProfile.default from the project's .gjc/config.yml or .gjc/settings.json if set there, or run gjc config reset modelProfile.default for the global setting.${refreshNotice}`;
+}
+
 async function applyStartupModelProfilesWithPolicy(
 	args: StartupModelProfileArgs,
 	onCredentialError?: (error: ModelProfileCredentialError) => void,
+	onUnknownDefault?: (error: UnknownModelProfileError, profileCatalogRefreshUnavailable: boolean) => void,
 ): Promise<void> {
+	let profileCatalogRefreshUnavailable = false;
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
 		options: {
 			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
 			tolerateCredentialError?: boolean;
+			tolerateUnknownDefault?: boolean;
+			runtimeBindingsOnly?: boolean;
 		} = {},
 	): Promise<boolean> => {
 		try {
-			await activateModelProfile(
-				{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-				{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
-			);
+			if (options.runtimeBindingsOnly) {
+				await applyModelProfileRuntimeBindings({
+					session: args.session,
+					modelRegistry: args.modelRegistry,
+					settings: args.settings,
+					profileName,
+				});
+			} else {
+				await activateModelProfile(
+					{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
+					{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+				);
+			}
 			return true;
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError && (onCredentialError || options.tolerateCredentialError)) {
 				if (onCredentialError) onCredentialError(error);
 				else process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
+				return false;
+			}
+			if (error instanceof UnknownModelProfileError && options.tolerateUnknownDefault) {
+				if (onUnknownDefault) onUnknownDefault(error, profileCatalogRefreshUnavailable);
+				else
+					process.stderr.write(
+						`${chalk.yellow(`Warning: ${staleDefaultProfileMessage(error, profileCatalogRefreshUnavailable)}`)}\n`,
+					);
 				return false;
 			}
 			throw error;
@@ -498,8 +534,8 @@ async function applyStartupModelProfilesWithPolicy(
 	// An explicit startup selector (--mpreset or --model) fully replaces the
 	// persisted default profile for this session, so a failing default must not
 	// abort a non-interactive run: it is reported as a warning and the explicit
-	// selection proceeds. Without an explicit selector the historic fatal
-	// contract is unchanged.
+	// selection proceeds. Without an explicit selector, failures remain fatal
+	// except for a stale default on input-free interactive startup.
 	const tolerateDefaultProfileFailure = args.parsedArgs.mpreset !== undefined || args.parsedArgs.model !== undefined;
 
 	// Capture the explicitly-selected startup model BEFORE profile activation can
@@ -510,7 +546,7 @@ async function applyStartupModelProfilesWithPolicy(
 	const preferCachedProfiles =
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
-	const applyConfiguredProfiles = async (): Promise<boolean> => {
+	const applyConfiguredProfiles = async (allowMissingDefault: boolean): Promise<boolean> => {
 		let applied = true;
 		if (defaultProfile) {
 			applied =
@@ -519,6 +555,9 @@ async function applyStartupModelProfilesWithPolicy(
 						? args.settings.get("defaultThinkingLevel")
 						: undefined,
 					tolerateCredentialError: tolerateDefaultProfileFailure,
+					tolerateUnknownDefault:
+						allowMissingDefault && (onUnknownDefault !== undefined || tolerateDefaultProfileFailure),
+					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
 				})) && applied;
 		}
 		if (args.parsedArgs.mpreset) {
@@ -531,12 +570,23 @@ async function applyStartupModelProfilesWithPolicy(
 		let applied: boolean;
 		let refreshedOnline = false;
 		try {
-			applied = await applyConfiguredProfiles();
+			applied = await applyConfiguredProfiles(false);
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
+			if (error instanceof UnknownModelProfileError) {
+				try {
+					await args.modelRegistry.refreshModelPresetProfilesFromRegistry();
+				} catch (refreshError) {
+					if (args.modelRegistry.getError()) throw refreshError;
+					profileCatalogRefreshUnavailable = true;
+					logger.warn("Failed to refresh model profile catalog before startup recovery", {
+						error: refreshError instanceof Error ? refreshError.message : String(refreshError),
+					});
+				}
+			}
 			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 			refreshedOnline = true;
-			applied = await applyConfiguredProfiles();
+			applied = await applyConfiguredProfiles(true);
 		}
 		if (applied && !refreshedOnline)
 			args.modelRegistry.refreshInBackground("online-if-uncached", args.session.credentialSessionId);
@@ -544,7 +594,7 @@ async function applyStartupModelProfilesWithPolicy(
 		if (defaultProfile || args.parsedArgs.mpreset) {
 			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 		}
-		await applyConfiguredProfiles();
+		await applyConfiguredProfiles(true);
 	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
@@ -600,6 +650,20 @@ export function isStartupModelProfileCredentialRecoveryEligible(options: {
 	);
 }
 
+function isStartupModelProfileStaleDefaultRecoveryEligible(
+	options: Parameters<typeof isStartupModelProfileCredentialRecoveryEligible>[0] & {
+		parsedArgs: Pick<Args, "continue" | "fork" | "resume">;
+	},
+): boolean {
+	return (
+		isStartupModelProfileCredentialRecoveryEligible(options) &&
+		options.parsedArgs.continue !== true &&
+		options.parsedArgs.fork === undefined &&
+		((options.parsedArgs.resume === undefined && options.resumeAction === undefined) ||
+			(options.parsedArgs.resume === true && options.resumeAction === "open-idle"))
+	);
+}
+
 export async function applyStartupModelProfilesForRoot(
 	args: StartupModelProfileArgs & {
 		isInteractive: boolean;
@@ -609,19 +673,21 @@ export async function applyStartupModelProfilesForRoot(
 		resumeAction: "continue-tail" | "open-idle" | undefined;
 	},
 ): Promise<{ recoverableErrors: string[] }> {
-	const policyArgs = { ...args, preferCachedModels: args.isInteractive };
-	if (!isStartupModelProfileCredentialRecoveryEligible(args)) {
-		try {
-			await applyStartupModelProfilesWithPolicy(policyArgs);
-		} catch (error) {
-			await exitForStartupModelProfileError(args, error);
-		}
-		return { recoverableErrors: [] };
-	}
-
+	const policyArgs = {
+		...args,
+		preferCachedModels: args.isInteractive,
+		preferCachedDefaultProfile: args.isInteractive,
+	};
 	const recoverableErrors: string[] = [];
+	const onCredentialError = isStartupModelProfileCredentialRecoveryEligible(args)
+		? (error: ModelProfileCredentialError) => recoverableErrors.push(error.message)
+		: undefined;
+	const onUnknownDefault = isStartupModelProfileStaleDefaultRecoveryEligible(args)
+		? (error: UnknownModelProfileError, profileCatalogRefreshUnavailable: boolean) =>
+				recoverableErrors.push(staleDefaultProfileMessage(error, profileCatalogRefreshUnavailable))
+		: undefined;
 	try {
-		await applyStartupModelProfilesWithPolicy(policyArgs, error => recoverableErrors.push(error.message));
+		await applyStartupModelProfilesWithPolicy(policyArgs, onCredentialError, onUnknownDefault);
 	} catch (error) {
 		await exitForStartupModelProfileError(args, error);
 	}
@@ -651,7 +717,9 @@ async function applyDeferredStartupModelProfilesForRoot(
 	const onCredentialError = isStartupModelProfileCredentialRecoveryEligible(args)
 		? (error: ModelProfileCredentialError) => recoverableErrors.push(error.message)
 		: undefined;
-	await applyStartupModelProfilesWithPolicy({ ...args, preferCachedModels: true }, onCredentialError);
+	await applyStartupModelProfilesWithPolicy({ ...args, preferCachedModels: true }, onCredentialError, error =>
+		recoverableErrors.push(staleDefaultProfileMessage(error)),
+	);
 	return { recoverableErrors };
 }
 
@@ -778,6 +846,10 @@ function isNormalLocalInteractiveRoute(parsed: Args): boolean {
 
 function hasResumePickerTerminal(): boolean {
 	return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+export function shouldNotifyModelFallback(authBootstrap: boolean | undefined, isInteractive: boolean): boolean {
+	return !(authBootstrap === true && isInteractive);
 }
 
 export async function runInteractiveMode(
@@ -1405,6 +1477,80 @@ export interface RunRootCommandDependencies {
 	loadSettingsForScope?: typeof Settings.loadForScope;
 }
 
+type DirectSessionManager = Pick<SessionManager, "getCwd" | "getSessionFile" | "getSessionId">;
+
+/**
+ * Direct CLI liveness is meaningful only for sessions with a durable transcript.
+ * An in-memory manager has no artifacts for GC to fence and must not touch the
+ * shared SDK session-index lock.
+ */
+export function directSessionRegistrationId(
+	sessionManager: DirectSessionManager | undefined,
+	lifecycleRequestId: string | undefined,
+): string | undefined {
+	if (lifecycleRequestId || sessionManager?.getSessionFile() === undefined) return undefined;
+	return sessionManager.getSessionId();
+}
+
+interface DirectSessionRegistrationDependencies {
+	createIndex?: (agentDir: string) => SessionIndex;
+	processIncarnation?: typeof processIncarnation;
+	registerPostmortem?: typeof postmortem.register;
+	masterRole?: { ownerSessionId: string; attestationEpoch: string };
+}
+
+/** Register a durable direct CLI session while leaving ephemeral sessions lock-free. */
+export async function registerDirectSession(
+	sessionManager: DirectSessionManager | undefined,
+	agentDir: string,
+	lifecycleRequestId: string | undefined,
+	dependencies: DirectSessionRegistrationDependencies = {},
+): Promise<void> {
+	const directSessionId = directSessionRegistrationId(sessionManager, lifecycleRequestId);
+	if (!directSessionId || !sessionManager) return;
+	const sessionIndex = dependencies.createIndex?.(agentDir) ?? new SessionIndex(agentDir);
+	const locator = await resolveSessionLocator(sessionManager.getCwd(), agentDir);
+	const directSessionIncarnation = (dependencies.processIncarnation ?? processIncarnation)(process.pid);
+	await sessionIndex.append({
+		type: "host_registered",
+		sessionId: directSessionId,
+		locator,
+		endpointGeneration: 0,
+		pid: process.pid,
+		...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
+		...(dependencies.masterRole && directSessionIncarnation
+			? {
+					masterRole: {
+						version: 2 as const,
+						ownerSessionId: dependencies.masterRole.ownerSessionId,
+						launchPid: process.pid,
+						launchProcessIncarnation: directSessionIncarnation,
+						role: "master" as const,
+						attestationEpoch: dependencies.masterRole.attestationEpoch,
+					},
+				}
+			: {}),
+	});
+	if (locator.worktreeRoot !== null) {
+		try {
+			await releaseLaunchWorktreeReservationAfterRegistration(agentDir, locator.worktreeRoot);
+		} catch (error) {
+			logger.warn("Failed to release launch worktree reservation after host registration", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	(dependencies.registerPostmortem ?? postmortem.register)("direct-session-index", async _reason => {
+		await sessionIndex.append({
+			type: "host_unregistered",
+			sessionId: directSessionId,
+			locator,
+			endpointGeneration: 0,
+			pid: process.pid,
+		});
+	});
+}
+
 export interface ModelRoleOverrides {
 	smol?: string;
 	slow?: string;
@@ -1987,55 +2133,15 @@ export async function runRootCommand(
 	}
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
-	const directSessionId = process.env.GJC_LIFECYCLE_REQUEST_ID ? undefined : sessionManager?.getSessionId();
-	if (directSessionId) {
-		const sessionIndex = new SessionIndex(settingsInstance.getAgentDir());
-		const locator = await resolveSessionLocator(sessionManager?.getCwd() ?? cwd, settingsInstance.getAgentDir());
-		// A pid is reusable, so the broker's teardown fence needs this session's OS
-		// start incarnation recorded alongside the pid it publishes.
-		const directSessionIncarnation = processIncarnation(process.pid);
-		await sessionIndex.append({
-			type: "host_registered",
-			sessionId: directSessionId,
-			locator,
-			endpointGeneration: 0,
-			pid: process.pid,
-			...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
-			...(masterModeContext && directSessionIncarnation
-				? {
-						masterRole: {
-							version: 2,
-							ownerSessionId: masterModeContext.ownerSessionId,
-							launchPid: process.pid,
-							launchProcessIncarnation: directSessionIncarnation,
-							role: "master" as const,
-							attestationEpoch: masterModeContext.attestationEpoch,
-						},
-					}
-				: {}),
-		});
-		if (locator.worktreeRoot !== null) {
-			try {
-				await releaseLaunchWorktreeReservationAfterRegistration(
-					settingsInstance.getAgentDir(),
-					locator.worktreeRoot,
-				);
-			} catch (error) {
-				logger.warn("Failed to release launch worktree reservation after host registration", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}
-		postmortem.register("direct-session-index", async () => {
-			await sessionIndex.append({
-				type: "host_unregistered",
-				sessionId: directSessionId,
-				locator,
-				endpointGeneration: 0,
-				pid: process.pid,
-			});
-		});
-	}
+	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
+	await registerDirectSession(sessionManager, settingsInstance.getAgentDir(), process.env.GJC_LIFECYCLE_REQUEST_ID, {
+		masterRole: masterModeContext
+			? {
+					ownerSessionId: masterModeContext.ownerSessionId,
+					attestationEpoch: masterModeContext.attestationEpoch,
+				}
+			: undefined,
+	});
 
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
@@ -2076,6 +2182,18 @@ export async function runRootCommand(
 		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
 		installHerdrReporter(listener => session.subscribe(listener));
 
+		// Exact MCP capability attaches at the root interactive entry point.
+		// Granted by creation path, not by call order:
+		// only a session this root command built for an interactive run with an
+		// explicit --mcp-config gets one. Sessions built through createAgentSession
+		// directly, sub-sessions, ACP, and print/text/json runs never reach here.
+		if (isInteractive && sessionOptions.mcpConfigPath) {
+			attachExactMcpControls(session, {
+				grantSource: "root-interactive-exact-config",
+				configPath: sessionOptions.mcpConfigPath,
+			});
+		}
+
 		let startDeferredModelProfiles: DeferredModelProfileStartup | undefined;
 		if (!(parsedArgs.authBootstrap === true && isInteractive)) {
 			const profileArgs = {
@@ -2114,7 +2232,7 @@ export async function runRootCommand(
 			}
 		}
 
-		if (modelFallbackMessage) {
+		if (modelFallbackMessage && shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive)) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
 		}
 

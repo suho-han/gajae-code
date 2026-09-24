@@ -19,6 +19,7 @@ import {
 	deriveLifecycleDeadlines,
 	executeLifecycle,
 	hasValidLifecycleDeadlines,
+	lifecycleFailureMessage,
 	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
@@ -63,6 +64,14 @@ async function waitFor<T>(read: () => Promise<T | undefined>, label: string): Pr
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 }
+
+test("formats cause-bearing diagnostics for children that started and exited", () => {
+	const child = { exitCode: 23, signalCode: null } as never;
+	expect(lifecycleFailureMessage("Session exited before readiness.", child)).toBe(
+		"Session exited before readiness. (exit=23)",
+	);
+});
+
 async function incarnation(pid: number): Promise<string> {
 	const value = processIncarnation(pid);
 	if (!value) throw new Error(`Process ${pid} has no readable incarnation.`);
@@ -407,6 +416,7 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 			GJC_AGENT_DIR: agentDir,
 			GJC_CODING_AGENT_DIR: agentDir,
 			GJC_SESSION_ID: sessionId,
+			GJC_STATE_ROOT: stateRoot,
 			GJC_LIFECYCLE_REQUEST_ID: "subprocess-proof",
 			GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
 		},
@@ -2598,8 +2608,50 @@ test("broker preserves spawn_failed when the ChildProcess emits an error before 
 			broker.handleRequest("session.create", { cwd: root }, "child-error-before-pid"),
 		).resolves.toMatchObject({
 			ok: false,
-			error: { code: "spawn_failed" },
+			error: { code: "spawn_failed", message: expect.stringContaining("ENOENT") },
 		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("broker reports child exit status without publishing detached-host stderr", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-child-diagnostic-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		setLifecycleCommandResolverForTest(broker, () => ({
+			file: process.execPath,
+			args: ["-e", "process.stderr.write('child-startup-failed' + 'x'.repeat(64 * 1024)); process.exit(23)"],
+		}));
+		await broker.start();
+		await expect(
+			broker.handleRequest(
+				"session.create",
+				{ cwd: root, readinessTimeoutMs: 4_000 },
+				"child-diagnostic-before-readiness",
+			),
+		).resolves.toMatchObject({
+			ok: false,
+			error: {
+				code: "spawn_failed",
+				message: expect.stringContaining("exit=23"),
+			},
+		});
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 4_000 },
+			"child-diagnostic-before-readiness",
+		);
+		expect(response).toMatchObject({
+			ok: false,
+			error: { message: expect.stringContaining("exit=23") },
+		});
+		expect(JSON.stringify(response)).not.toContain("child-startup-failed");
+		const sdkDirectory = path.join(root, ".gjc", "state", "sdk");
+		const names = await fs.readdir(sdkDirectory).catch(() => [] as string[]);
+		expect(names.some(name => name.includes(".lifecycle.stderr.") && name.endsWith(".log"))).toBe(false);
 	} finally {
 		setLifecycleCommandResolverForTest(broker, undefined);
 		await broker.stop();
@@ -3122,19 +3174,207 @@ test("broker records the resolved worktree state root and preserves pre-child pr
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);
-test("broker fails closed when the reopened terminal ledger cannot reproduce its response", async () => {
+test("broker preserves a settled response when terminal persistence read-back is unavailable", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ledger-mismatch-"));
 	const broker = new Broker({ agentDir });
 	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
 	try {
 		await broker.start();
-		LifecycleLedger.prototype.readTerminal = async () => undefined;
+		LifecycleLedger.prototype.readTerminal = async () => ({ kind: "absent" });
 		const response = await broker.handleRequest(
 			"session.unknown",
 			{ sessionId: "ledger-mismatch" },
 			"ledger-mismatch",
 		);
 		expect(response).toEqual({
+			ok: false,
+			error: {
+				code: "invalid_input",
+				message: "Unknown lifecycle operation.",
+			},
+		});
+		const rows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(rows.findLast(row => row.operationKey === "session.unknown\0ledger-mismatch")).toMatchObject({
+			state: "terminal_error",
+			response,
+		});
+	} finally {
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("successful create stays settled when terminal read-back is unavailable and the next create proceeds", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-terminal-readback-create-"));
+	const agentDir = path.join(root, "agent");
+	const broker = new Broker({ agentDir });
+	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
+	let firstSessionId: string | undefined;
+	let secondSessionId: string | undefined;
+	try {
+		await broker.start();
+		LifecycleLedger.prototype.readTerminal = async () => ({ kind: "absent" });
+		const first = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 10_000 },
+			"terminal-readback-first",
+		);
+		expect(first.ok).toBe(true);
+		if (!first.ok || typeof (first.result as { sessionId?: unknown }).sessionId !== "string")
+			throw new Error("Expected the first create to succeed.");
+		firstSessionId = (first.result as { sessionId: string }).sessionId;
+
+		const firstRows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(firstRows.findLast(row => row.operationKey === "session.create\0terminal-readback-first")).toMatchObject({
+			state: "terminal_ok",
+			response: { ok: true, result: { sessionId: firstSessionId } },
+		});
+
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
+		const second = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 10_000 },
+			"terminal-readback-second",
+		);
+		expect(second.ok).toBe(true);
+		if (!second.ok || typeof (second.result as { sessionId?: unknown }).sessionId !== "string")
+			throw new Error("Expected the second create to succeed.");
+		secondSessionId = (second.result as { sessionId: string }).sessionId;
+	} finally {
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
+		for (const [sessionId, key] of [
+			[firstSessionId, "terminal-readback-close-first"],
+			[secondSessionId, "terminal-readback-close-second"],
+		] as const) {
+			if (sessionId) await broker.handleRequest("session.close", { sessionId }, key).catch(() => undefined);
+		}
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
+test("broker distinguishes an absent ledger from a damaged ledger during create read-back", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-terminal-readback-source-"));
+	const agentDir = path.join(root, "agent");
+	const ledgerPath = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+	const broker = new Broker({ agentDir });
+	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
+	const absentKey = "terminal-readback-source-absent";
+	const damagedKey = "terminal-readback-source-damaged";
+	let absentSessionId: string | undefined;
+	let damagedSessionId: string | undefined;
+	try {
+		await broker.start();
+		const readBackMode = new Map<string, "absent" | "damaged">([
+			[await deriveIdempotencyIdentity(agentDir, "session.create", absentKey), "absent"],
+			[await deriveIdempotencyIdentity(agentDir, "session.create", damagedKey), "damaged"],
+		]);
+		LifecycleLedger.prototype.readTerminal = async function (identity, requestHash) {
+			const mode = readBackMode.get(identity);
+			if (!mode) return originalReadTerminal.call(this, identity, requestHash);
+			const displacedPath = `${ledgerPath}.${mode}`;
+			let displaced = false;
+			let damaged = false;
+			try {
+				await fs.rename(ledgerPath, displacedPath);
+				displaced = true;
+				if (mode === "damaged") {
+					await fs.mkdir(ledgerPath);
+					damaged = true;
+				}
+				return await originalReadTerminal.call(this, identity, requestHash);
+			} finally {
+				try {
+					if (damaged) await fs.rm(ledgerPath, { recursive: true, force: true });
+				} finally {
+					if (displaced) await fs.rename(displacedPath, ledgerPath);
+				}
+			}
+		};
+
+		const absent = await broker.handleRequest("session.create", { cwd: root, readinessTimeoutMs: 10_000 }, absentKey);
+		expect(absent.ok).toBe(true);
+		if (!absent.ok || typeof (absent.result as { sessionId?: unknown }).sessionId !== "string")
+			throw new Error("Expected the absent-source create to succeed.");
+		absentSessionId = (absent.result as { sessionId: string }).sessionId;
+		const absentIdentity = await deriveIdempotencyIdentity(agentDir, "session.create", absentKey);
+		const absentRows = (await fs.readFile(ledgerPath, "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		const absentOperationRows = absentRows.filter(row => row.identity === absentIdentity);
+		expect(absentOperationRows.findLast(row => row.operationKey === `session.create\0${absentKey}`)).toMatchObject({
+			state: "terminal_ok",
+			response: { ok: true, result: { sessionId: absentSessionId } },
+		});
+		expect(absentOperationRows.some(row => row.state === "terminal_uncertain")).toBe(false);
+
+		const damaged = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 10_000 },
+			damagedKey,
+		);
+		expect(damaged).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		const damagedIdentity = await deriveIdempotencyIdentity(agentDir, "session.create", damagedKey);
+		const damagedRows = (await fs.readFile(ledgerPath, "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		const damagedOperationRows = damagedRows.filter(row => row.identity === damagedIdentity);
+		expect(damagedOperationRows.findLast(row => row.operationKey === `session.create\0${damagedKey}`)).toMatchObject({
+			state: "terminal_uncertain",
+		});
+		const effectIntent = damagedOperationRows.findLast(row => row.state === "terminal_uncertain")?.effectIntent as
+			| { sessionId?: unknown }
+			| undefined;
+		if (typeof effectIntent?.sessionId === "string") damagedSessionId = effectIntent.sessionId;
+	} finally {
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
+		for (const [sessionId, key] of [
+			[absentSessionId, "terminal-readback-source-close-absent"],
+			[damagedSessionId, "terminal-readback-source-close-damaged"],
+		] as const) {
+			if (sessionId) await broker.handleRequest("session.close", { sessionId }, key).catch(() => undefined);
+		}
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("broker marks a terminal outcome uncertain only when readable evidence conflicts", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-terminal-conflict-"));
+	const broker = new Broker({ agentDir });
+	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
+	try {
+		await broker.start();
+		LifecycleLedger.prototype.readTerminal = async function (identity, requestHash) {
+			const readBack = await originalReadTerminal.call(this, identity, requestHash);
+			// Only a *readable* row is tampered with here: the point of this case is that a
+			// decodable row whose contents disagree goes uncertain, which is a different
+			// path from an absent read-back and from a rejected one.
+			return readBack.kind === "terminal"
+				? {
+						kind: "terminal" as const,
+						entry: {
+							...readBack.entry,
+							response: { ok: false, error: { code: "tampered", message: "readable conflict" } },
+						},
+					}
+				: readBack;
+		};
+		const response = await broker.handleRequest(
+			"session.unknown",
+			{ sessionId: "terminal-conflict" },
+			"terminal-conflict",
+		);
+		expect(response).toMatchObject({
 			ok: false,
 			error: {
 				code: "terminal_uncertain",
@@ -5362,6 +5602,7 @@ test("session-host-internal exits with a sanitized startup failure before writin
 				GJC_AGENT_DIR: agentDir,
 				GJC_CODING_AGENT_DIR: agentDir,
 				GJC_SESSION_ID: sessionId,
+				GJC_STATE_ROOT: stateRoot,
 				GJC_LIFECYCLE_REQUEST_ID: "startup-failure-proof",
 				GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify({
 					operation: "session.create",
@@ -5480,9 +5721,11 @@ test("never-settling model profile startup cuts off with proven pre-registration
 		const input = { cwd: root, readinessTimeoutMs: 4_000 };
 		const response = await broker.handleRequest("session.create", input, "profile-cutoff");
 		if (!response.ok && response.error.code === "terminal_uncertain") {
-			expect(response.error.message).toBe(
+			expect(response.error.message).toContain(
 				"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
 			);
+			expect(response.error.message).toContain("stage=readiness");
+			expect(response.error.message).toContain("waiting_for=session_ready");
 			const replay = await broker.handleRequest("session.create", input, "profile-cutoff");
 			expect(replay).toEqual(response);
 			return;
@@ -5848,6 +6091,11 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 		});
 		const sdkEntries = await fs.readdir(path.join(root, ".gjc", "state", "sdk"));
 		expect(sdkEntries.some(entry => entry.includes(".lifecycle.failure."))).toBe(false);
+		// A successful launch retires its startup stderr artifact as soon as the
+		// broker is done reading it; the host's later output must not accumulate
+		// under the agent directory (#5739 review).
+		const agentSdkEntries = await fs.readdir(path.join(agentDir, "sdk"));
+		expect(agentSdkEntries.filter(entry => entry.startsWith("lifecycle-spawn."))).toEqual([]);
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });

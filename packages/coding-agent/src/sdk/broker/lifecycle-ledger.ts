@@ -100,6 +100,32 @@ export type BeginResult =
 	| { kind: "idempotency_conflict" }
 	| { kind: "terminal_uncertain"; entry: LifecycleLedgerEntry }
 	| { kind: "in_progress"; entry: LifecycleLedgerEntry };
+
+type BoundedSourceReadRejection = "not-regular-file" | "oversized-by-stat" | "oversized-by-read" | "read-error";
+
+/**
+ * Why a terminal read-back produced no entry. `absent` means nothing terminal is
+ * recorded for the request; `rejected` means the source or a row was refused, which
+ * is evidence of a damaged ledger rather than of an unpersisted operation. Collapsing
+ * the two lets a corrupt source or row read as "not yet written" and unfence the session.
+ */
+export type TerminalReadBackRejection =
+	| "bounds"
+	| "shape"
+	| "undecodable"
+	| "row-not-attributable"
+	| "partial-row"
+	| BoundedSourceReadRejection;
+export type TerminalReadBack =
+	| { kind: "terminal"; entry: LifecycleLedgerEntry }
+	| { kind: "absent" }
+	| { kind: "rejected"; reason: TerminalReadBackRejection };
+
+type BoundedSourceRead =
+	| { kind: "absent" }
+	| { kind: "source"; source: Buffer }
+	| { kind: "rejected"; reason: BoundedSourceReadRejection };
+
 const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
 const final = (s: LifecycleState) => terminal(s) || s === "terminal_uncertain";
 export interface LifecycleLedgerLimits {
@@ -117,6 +143,11 @@ function canonicalCleanupSessionId(value: unknown): value is string {
 }
 
 const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
+	// Terminal evidence intentionally has no time-based expiry: forgetting a
+	// completed close would allow a delayed duplicate to reach a later host
+	// generation. The row/byte bounds below are storage limits; compaction keeps
+	// each identity's accepted anchor and latest terminal state instead of
+	// expiring replay authority.
 	maxBytes: 64 * 1024 * 1024,
 	maxLineBytes: 8 * 1024 * 1024,
 	maxRows: 10_000,
@@ -376,9 +407,11 @@ export class LifecycleLedger {
 	 * uncertainly persists that conclusion, and refusing to read it back would report a
 	 * synced row as unpersisted and replace its true reason with a generic one.
 	 */
-	async readTerminal(identity: string, requestHash: string): Promise<LifecycleLedgerEntry | undefined> {
-		const source = await this.#readBoundedSourceReadOnly();
-		if (!source) return undefined;
+	async readTerminal(identity: string, requestHash: string): Promise<TerminalReadBack> {
+		const sourceRead = await this.#readBoundedSourceReadOnly();
+		if (sourceRead.kind === "absent") return sourceRead;
+		if (sourceRead.kind === "rejected") return sourceRead;
+		const { source } = sourceRead;
 		let prior: LifecycleLedgerEntry | undefined;
 		let latest: LifecycleLedgerEntry | undefined;
 		let rows = 0;
@@ -391,15 +424,16 @@ export class LifecycleLedger {
 			lineStart = offset + 1;
 			if (line.length === 0) continue;
 			rows += 1;
-			if (rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes) return undefined;
+			if (rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes)
+				return { kind: "rejected", reason: "bounds" };
 			let entry: LifecycleLedgerEntry;
 			try {
 				const value = parseLifecycleJson(line);
 				assertSupportedStateVersion(this.#file, value);
-				if (!isLifecycleLedgerEntry(value)) return undefined;
+				if (!isLifecycleLedgerEntry(value)) return { kind: "rejected", reason: "shape" };
 				entry = value;
 			} catch {
-				return undefined;
+				return { kind: "rejected", reason: "undecodable" };
 			}
 			if (entry.identity !== identity) continue;
 			if (
@@ -407,7 +441,7 @@ export class LifecycleLedger {
 				!hasValidTerminalDigests(entry) ||
 				!this.#isValidHistoryContinuation(prior, entry)
 			)
-				return undefined;
+				return { kind: "rejected", reason: "row-not-attributable" };
 			prior = entry;
 			latest = entry;
 		}
@@ -417,9 +451,11 @@ export class LifecycleLedger {
 			// a partially persisted row from this identity without inspecting arbitrary
 			// malformed data as a valid record.
 			const identityMarker = Buffer.from(`"identity":${JSON.stringify(identity)}`);
-			if (tail.includes(identityMarker)) return undefined;
+			if (tail.includes(identityMarker)) return { kind: "rejected", reason: "partial-row" };
 		}
-		return latest && final(latest.state) ? latest : undefined;
+		// No matching row, or one that has not reached a terminal state yet, is genuine
+		// absence: nothing was rejected, there is simply nothing terminal to read back.
+		return latest && final(latest.state) ? { kind: "terminal", entry: latest } : { kind: "absent" };
 	}
 
 	/**
@@ -512,19 +548,21 @@ export class LifecycleLedger {
 			if (handle) await handle.close();
 		}
 	}
-	async #readBoundedSourceReadOnly(): Promise<Buffer | undefined> {
+	async #readBoundedSourceReadOnly(): Promise<BoundedSourceRead> {
 		let handle: fs.FileHandle | undefined;
 		try {
-			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+			const nonBlocking = process.platform === "win32" ? 0 : fsSync.constants.O_NONBLOCK;
+			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW | nonBlocking);
 			const stat = await handle.stat({ bigint: true });
-			if (!stat.isFile() || stat.size > BigInt(this.#limits.maxBytes)) return undefined;
+			if (!stat.isFile()) return { kind: "rejected", reason: "not-regular-file" };
+			if (stat.size > BigInt(this.#limits.maxBytes)) return { kind: "rejected", reason: "oversized-by-stat" };
 			const bytes = Buffer.alloc(Number(stat.size) + 1);
 			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-			if (bytesRead > this.#limits.maxBytes) return undefined;
-			return bytes.subarray(0, bytesRead);
+			if (bytesRead > this.#limits.maxBytes) return { kind: "rejected", reason: "oversized-by-read" };
+			return { kind: "source", source: bytes.subarray(0, bytesRead) };
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-			return undefined;
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+			return { kind: "rejected", reason: "read-error" };
 		} finally {
 			if (handle) await handle.close();
 		}
@@ -621,7 +659,7 @@ export class LifecycleLedger {
 		for (const [identity, latest] of compacted) {
 			const anchor = anchors.get(identity);
 			if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
-			snapshot.push(anchor);
+			snapshot.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
 			if (latest.state !== "accepted") snapshot.push(latest);
 		}
 		const contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
@@ -663,16 +701,36 @@ export class LifecycleLedger {
 		}
 		return replacement !== undefined;
 	}
-	findByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
-		return [...this.#byIdentity.values()].find(entry => entry.operationKey === operationKey);
+	findByOperationKey(operationKey: string, fingerprint?: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].findLast(
+			entry =>
+				entry.operationKey === operationKey && (fingerprint === undefined || entry.fingerprint === fingerprint),
+		);
+	}
+	findAnyByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].findLast(entry => entry.operationKey === operationKey);
 	}
 	/**
-	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
+	 * Live or uncertain legacy rows predate the operation/key index. Their opaque
 	 * identities cannot establish that a different target is safe, so callers
-	 * must reject rather than create a second admission.
+	 * must reject rather than create a second admission. A fresh session.create
+	 * may ignore completed terminal legacy rows so old successful operations do
+	 * not block coordinator startup. Other operations retain the legacy fence
+	 * because target-bound legacy identities cannot prove key uniqueness. For
+	 * target-bound terminal creates, the opaque legacy identity also cannot reveal
+	 * the original caller key, so this exception retires that legacy key history;
+	 * exact key-only legacy creates are still rejected by the earlier lookup.
 	 */
-	hasLegacyIdentity(): boolean {
-		return [...this.#byIdentity.values()].some(entry => entry.operationKey === undefined);
+	hasLegacyIdentity(
+		excludedIdentities?: ReadonlySet<string>,
+		options: { ignoreTerminalRows?: boolean } = {},
+	): boolean {
+		return [...this.#byIdentity.values()].some(
+			entry =>
+				entry.operationKey === undefined &&
+				!(options.ignoreTerminalRows && terminal(entry.state)) &&
+				!excludedIdentities?.has(entry.identity),
+		);
 	}
 	async migrateIdentity(
 		from: string,
@@ -680,15 +738,32 @@ export class LifecycleLedger {
 		metadata: { operationKey: string; fingerprint: string },
 	): Promise<LifecycleLedgerEntry | undefined> {
 		return this.#mutate(async () => {
-			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
+			const existing = this.#byIdentity.get(to);
 			const entry = this.#byIdentity.get(from);
-			if (!entry) return undefined;
-			const migrated = await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
-			// Retire the legacy row so hasLegacyIdentity() returns false and future
-			// unrelated lifecycle requests are not globally blocked. The legacy
-			// identity gets a metadata-bearing replacement row in the append-only
-			// log, superseding the original metadata-free entry in #byIdentity.
-			if (entry.operationKey === undefined) await this.#append({ ...entry, ...metadata, ts: Date.now() });
+			if (!entry) return existing;
+			if (existing) {
+				if (entry.operationKey === undefined) {
+					await this.#compact({ ...entry, ...metadata, ts: Date.now() });
+				}
+				return existing;
+			}
+			// A migrated identity needs the same accepted anchor as a fresh request;
+			// appending only a terminal row would be quarantined on the next restart.
+			await this.#append({
+				version: SDK_STATE_VERSION,
+				identity: to,
+				requestHash: entry.requestHash,
+				...metadata,
+				state: "accepted",
+				ts: Date.now(),
+			});
+			const migrated =
+				entry.state === "accepted"
+					? this.#byIdentity.get(to)
+					: await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
+			// Retire metadata-free legacy rows by rewriting their latest row in place;
+			// appending a duplicate terminal row would violate the ledger history rules.
+			if (entry.operationKey === undefined) await this.#compact({ ...entry, ...metadata, ts: Date.now() });
 			return migrated;
 		});
 	}
@@ -723,7 +798,7 @@ export class LifecycleLedger {
 	async begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string } = {},
+		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string } = {},
 	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
@@ -731,7 +806,7 @@ export class LifecycleLedger {
 	async #begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string },
+		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string },
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
@@ -743,6 +818,7 @@ export class LifecycleLedger {
 					requestHash,
 					operationKey: metadata.operationKey,
 					fingerprint: metadata.fingerprint,
+					intendedSessionId: metadata.intendedSessionId,
 					state: "accepted",
 					ts: Date.now(),
 				}),

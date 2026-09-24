@@ -1,11 +1,12 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { Agent, type AgentTool, type RunSettlementProof } from "@gajae-code/agent-core";
-import { closeModelCache, getBundledModel } from "@gajae-code/ai";
+import { type AssistantMessage, closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
@@ -14,6 +15,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type {
+	AgentEndEvent,
 	ExtensionActions,
 	ExtensionAPI,
 	ExtensionContextActions,
@@ -66,15 +68,16 @@ import {
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { sessionHostAttachedClients, sessionHostWorkLeaseActive } from "../src/sdk/broker/lifecycle";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
-import { SessionSdkHost } from "../src/sdk/host";
+import { SESSION_HOST_OBSERVER_CAPABILITY, SessionSdkHost } from "../src/sdk/host";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
-import type { SessionAttachment } from "../src/sdk/router/session-router";
+import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
@@ -93,6 +96,7 @@ import type {
 import * as sessionSdkRunCapability from "../src/session/sdk-run-capability";
 import { readSdkRunCapability } from "../src/session/sdk-run-capability";
 import { SessionManager } from "../src/session/session-manager";
+import { createSessionWorkLease, type SessionWorkLease } from "../src/session/session-work-lease";
 
 type CapturedSendUserMessage = (
 	content: Parameters<ExtensionActions["sendUserMessage"]>[0],
@@ -765,6 +769,569 @@ test("production SDK host starts exactly one instrumented server (no duplicate a
 	} finally {
 		serverStart.mockRestore();
 		await host?.stop();
+	}
+}, 60_000);
+
+test("observer daemon demand covers hello-before-replay, replay-after, and disconnect-before-replay while live work promotes demand", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-observer-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	const observer = new SdkClient(host.endpoint.url, host.endpoint.token, {
+		capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+		reconnectAttempts: 0,
+	});
+	try {
+		await observer.connect();
+		// The authenticated hello is authoritative; replay is not required to
+		// establish the observer role.
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand, "observer hello negotiation");
+		await observer.request({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 });
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+
+		await host.session.extensionRunner?.emit({ type: "agent_start" });
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		await host.session.extensionRunner?.emit({
+			type: "agent_end",
+			stopReason: "completed",
+			messages: [{ role: "assistant", stopReason: "stop" }],
+		} as never);
+		await Bun.sleep(20);
+		expect(sessionHostWorkLeaseActive()).toBe(false);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+
+		const disconnectedBeforeReplay = new SdkClient(host.endpoint.url, host.endpoint.token, {
+			capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+			reconnectAttempts: 0,
+		});
+		await disconnectedBeforeReplay.connect();
+		await disconnectedBeforeReplay.close();
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+	} finally {
+		await observer.close();
+		await host.stop();
+	}
+}, 60_000);
+
+test("accepted prompt keeps the host lease held until active lifecycle settles", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-admission-lease-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-admission-lease-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "admission-lease",
+			operation: "turn.prompt",
+			input: { text: "hold the host lease" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "admission-lease"),
+		"accepted prompt response",
+	);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_end")?.(
+		{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] },
+		sessionContext,
+	);
+	await waitFor(() => !sessionHostWorkLeaseActive(), "active lifecycle lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("accepted steer failure releases its queued host lease", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-lease-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steer-lease-failure-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+			throw Object.assign(new Error("steer dispatch failed after acceptance"), { code: "unavailable" });
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "steer-lease-failure",
+			operation: "turn.steer",
+			input: { text: "fail after acceptance" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "steer-lease-failure"),
+		"steer failure response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "steer-lease-failure")).toMatchObject({
+		ok: false,
+		error: { code: "unavailable" },
+	});
+	await waitFor(() => !sessionHostWorkLeaseActive(), "failed steer lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+/**
+ * Bring up a session host whose `sendUserMessage` captures every promotion hook
+ * per dispatched submission, connect one SDK socket, and return the pieces the
+ * lease-ownership tests drive by hand.
+ */
+async function startLeaseHarness(
+	prefix: string,
+	dispatch: (options: InternalCapturedOptions | undefined, index: number) => Promise<void> | void = async options => {
+		await firePreflightAccept(options);
+	},
+	contextOverrides: Record<string, unknown> = {},
+): Promise<{
+	handlers: Map<string, (event: unknown, context: unknown) => unknown>;
+	sessionContext: Record<string, unknown>;
+	sends: InternalCapturedOptions[];
+	frames: Record<string, unknown>[];
+	socket: WebSocket;
+	control(id: string, operation: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
+}> {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-${prefix}-`));
+	dirs.push(cwd);
+	const sessionId = `sdk-${prefix}-${Date.now()}`;
+	const sessionContext = { ...context(cwd, sessionId), ...contextOverrides };
+	const sends: InternalCapturedOptions[] = [];
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			const captured = options as InternalCapturedOptions | undefined;
+			if (captured) sends.push(captured);
+			await dispatch(captured, sends.length - 1);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+		socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id) as Record<string, unknown>;
+	};
+	return { handlers, sessionContext, sends, frames, socket, control };
+}
+
+test("every submission promoted into one batched run releases its own lease at that run's agent_start", async () => {
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("batched-promotion");
+	await control("steer-a", "turn.steer", { text: "first" });
+	await control("steer-b", "turn.steer", { text: "second" });
+	await control("steer-c", "turn.steer", { text: "third" });
+	expect(sends).toHaveLength(3);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	// agent_end disowned all three steers and rearmed them as ONE follow-up
+	// batch: the session fires every hook with startsOwnRun: true, then one
+	// agent_start follows for the batch.
+	for (const options of sends) options.onQueuedPromoted?.({ startsOwnRun: true });
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_end")?.(assistantEndEvent("batched"), sessionContext);
+	await waitFor(() => !sessionHostWorkLeaseActive(), "batched promotion lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+/** A session work lease that also reports how many handles are outstanding. */
+function countingSessionWorkLease(): SessionWorkLease & { outstanding(): number } {
+	const lease = createSessionWorkLease();
+	let outstanding = 0;
+	return {
+		acquire: () => {
+			const handle = lease.acquire();
+			outstanding += 1;
+			let released = false;
+			return {
+				release: () => {
+					if (released) return;
+					released = true;
+					outstanding -= 1;
+					handle.release();
+				},
+			};
+		},
+		isHeld: () => lease.isHeld(),
+		outstanding: () => outstanding,
+	};
+}
+
+test("a promoted run releases the promoted submission's own lease, not the oldest admitted one", async () => {
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("promotion-order", undefined, {
+		getSessionWorkLease: () => lease,
+	});
+	await control("follow-up", "turn.follow_up", { text: "queued first" });
+	await control("steer", "turn.steer", { text: "queued second" });
+	expect(sends).toHaveLength(2);
+	// Two queued admissions plus the follow-up's accepted submission record.
+	expect(lease.outstanding()).toBe(3);
+	const [followUp, steer] = sends;
+	// Disowned steering is prepended ahead of the earlier follow-up: the steer
+	// starts the run and the follow-up is consumed inside it.
+	steer?.onQueuedPromoted?.({ startsOwnRun: true });
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	// The run's own handle replaced the steer's; the follow-up's is untouched.
+	expect(lease.outstanding()).toBe(3);
+	followUp?.onQueuedPromoted?.({ startsOwnRun: false });
+	expect(lease.outstanding()).toBe(2);
+	await handlers.get("agent_end")?.(assistantEndEvent("reordered"), sessionContext);
+	// Only the follow-up's submission record remains, bounded by its own
+	// terminal/deadline; no admission handle survives the run.
+	await waitFor(() => lease.outstanding() === 1, "reordered promotion lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("an accepted prompt diverted into steering or removed from the queue releases its admission lease", async () => {
+	// Count outstanding handles directly: the accepted submission's own record
+	// lease stays held until its terminal, so the aggregate cannot distinguish a
+	// released admission handle from a leaked one here.
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness(
+		"prompt-queue-exit",
+		async (options, index) => {
+			await firePreflightAccept(options);
+			// The session began streaming before the first dispatch ran: the prompt
+			// was parked as steering and its submission resolves at queue time.
+			if (index === 0) options?.onDispatchDisposition?.({ startsOwnRun: false });
+		},
+		{ getSessionWorkLease: () => lease },
+	);
+	await control("diverted", "turn.prompt", { text: "raced into steering" });
+	await waitFor(() => sends.length === 1, "diverted prompt dispatch");
+	await Bun.sleep(20);
+	// Submission record + queued admission.
+	expect(lease.outstanding()).toBe(2);
+	sends[0]?.onQueuedPromoted?.({ startsOwnRun: false });
+	expect(lease.outstanding()).toBe(1);
+
+	await control("queued", "turn.follow_up", { text: "cleared from the queue" });
+	await waitFor(() => sends.length === 2, "follow-up dispatch");
+	await Bun.sleep(20);
+	expect(lease.outstanding()).toBe(3);
+	sends[1]?.onQueuedPromoted?.({ startsOwnRun: true, removed: true });
+	expect(lease.outstanding()).toBe(2);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("a steer whose durable settlement fails after dispatch keeps its lease while the message stays queued", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-settle-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steer-settle-failure-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const sends: InternalCapturedOptions[] = [];
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (_content, options) => {
+				if (options) sends.push(options as InternalCapturedOptions);
+				await firePreflightAccept(options);
+				// The reservation write committed; the NEXT commit is the accepted
+				// settlement, which fails at its atomic rename.
+				failedCommit.arm();
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "steer-settle-failure",
+				operation: "turn.steer",
+				input: { text: "queued but not durably settled", clientRef: "steer-settle-failure-ref" },
+			}),
+		);
+		await failedCommit.failed;
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "steer-settle-failure"),
+			"steer settlement response",
+		);
+		expect(sends).toHaveLength(1);
+		// The message is still queued in the session, so the host must stay alive
+		// until the session's own promotion or removal hook retires it.
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		sends[0]?.onQueuedPromoted?.({ startsOwnRun: false });
+		await waitFor(() => !sessionHostWorkLeaseActive(), "queued steer lease release");
+		// Teardown reports the injected persistence failure by contract (#4743).
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+	} finally {
+		warnSpy.mockRestore();
+		failedCommit.restore();
+	}
+}, 60_000);
+
+test("a submission promoted after its runtime stopped releases its lease instead of parking it", async () => {
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("late-promotion", undefined, {
+		getSessionWorkLease: () => lease,
+	});
+	await control("steer", "turn.steer", { text: "promoted after teardown" });
+	expect(lease.outstanding()).toBe(1);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	// The runtime is fenced and its lists drained; a promotion that lands now
+	// has no run to hand its handle to.
+	expect(lease.outstanding()).toBe(1);
+	sends[0]?.onQueuedPromoted?.({ startsOwnRun: true });
+	expect(lease.outstanding()).toBe(0);
+}, 60_000);
+
+test("an accepted prompt that fails closed before its terminal releases its submission lease", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fail-closed-lease-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-fail-closed-lease-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (_content, options) => {
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "fail-closed",
+				operation: "turn.prompt",
+				input: { text: "terminal claim will not persist", clientRef: "fail-closed-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "fail-closed"),
+			"accepted prompt response",
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		// The acceptance and agent_start writes committed; the terminal claim is
+		// the next commit and fails, so the prompt fails closed with no later
+		// traffic to expire its record.
+		failedCommit.arm();
+		await handlers.get("agent_end")?.(assistantEndEvent("lost"), sessionContext);
+		await failedCommit.failed;
+		await waitFor(
+			() => frames.some(frame => frame.type === "agent_failed" && frame.error !== undefined),
+			"fail-closed terminal frame",
+		);
+		await waitFor(() => !sessionHostWorkLeaseActive(), "fail-closed lease release");
+		await Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext)).catch(
+			() => undefined,
+		);
+	} finally {
+		errorSpy.mockRestore();
+		warnSpy.mockRestore();
+		failedCommit.restore();
+	}
+}, 60_000);
+
+test("replay capability claims cannot turn a demanding connection into an observer", async () => {
+	let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+	const sdkFrameImpl = NotificationServer.prototype.onSdkFrame;
+	const sdkFrameHook = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		sdkFrame = callback;
+		return sdkFrameImpl.call(this, callback);
+	});
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-replay-capability-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	const demanding = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+	sockets.push(demanding);
+	let connectionId: string | undefined;
+	demanding.addEventListener("message", event => {
+		const frame = JSON.parse(String((event as MessageEvent).data)) as { type?: unknown; connectionId?: unknown };
+		if (frame.type === "hello" && typeof frame.connectionId === "string") connectionId = frame.connectionId;
+	});
+	try {
+		await new Promise<void>((resolve, reject) => {
+			demanding.addEventListener("open", () => resolve(), { once: true });
+			demanding.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
+		await waitFor(() => sdkFrame !== undefined && connectionId !== undefined, "SDK callback wiring");
+		sdkFrame!(null, {
+			connectionId: connectionId!,
+			json: JSON.stringify({
+				type: "event_replay",
+				id: "forged-observer",
+				sinceGeneration: 1,
+				sinceSeq: 0,
+				capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+			}),
+		});
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		demanding.close();
+		await host.stop();
+		sdkFrameHook.mockRestore();
+	}
+}, 60_000);
+
+test("a default ACP-shaped SessionRouter client remains demanding", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	// ACP constructs the default router without notification-daemon observer role.
+	const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent") });
+	try {
+		await router.start();
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
+			"default SessionRouter demand attachment",
+		);
+		await Bun.sleep(100);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		await router.stop();
+		await host.stop();
+	}
+}, 60_000);
+
+test("late capability and replay callbacks after close cannot erase a live demanding client", async () => {
+	let negotiated: Parameters<NotificationServer["onNegotiatedCapabilities"]>[0] | undefined;
+	let closed: Parameters<NotificationServer["onConnectionClose"]>[0] | undefined;
+	let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+	const negotiatedImpl = NotificationServer.prototype.onNegotiatedCapabilities;
+	const closedImpl = NotificationServer.prototype.onConnectionClose;
+	const sdkFrameImpl = NotificationServer.prototype.onSdkFrame;
+	const negotiatedHook = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		negotiated = callback;
+		return negotiatedImpl.call(this, callback);
+	});
+	const closedHook = spyOn(NotificationServer.prototype, "onConnectionClose").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		closed = callback;
+		return closedImpl.call(this, callback);
+	});
+	const sdkFrameHook = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		sdkFrame = callback;
+		return sdkFrameImpl.call(this, callback);
+	});
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-late-capability-close-"));
+	dirs.push(cwd);
+	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
+	let demanding: SdkClient | undefined;
+	try {
+		host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+		const baseDemand = sessionHostAttachedClients() ?? 0;
+		demanding = new SdkClient(host.endpoint.url, host.endpoint.token, { reconnectAttempts: 0 });
+		await demanding.connect();
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
+		if (!negotiated || !closed || !sdkFrame) throw new Error("native callback capture failed");
+
+		closed(null, "closed-before-late-callback");
+		negotiated(null, "closed-before-late-callback", [SESSION_HOST_OBSERVER_CAPABILITY]);
+		sdkFrame(null, {
+			connectionId: "closed-before-late-callback",
+			json: JSON.stringify({ type: "event_replay", capabilities: [SESSION_HOST_OBSERVER_CAPABILITY] }),
+		});
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		await demanding?.close();
+		await host?.stop();
+		negotiatedHook.mockRestore();
+		closedHook.mockRestore();
+		sdkFrameHook.mockRestore();
 	}
 }, 60_000);
 
@@ -1780,11 +2347,19 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
 				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
 			],
-			{ preflightSignal: expect.any(AbortSignal) },
+			{
+				preflightSignal: expect.any(AbortSignal),
+				onQueuedPromoted: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
+			},
 		],
 		[
 			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
-			{ preflightSignal: expect.any(AbortSignal) },
+			{
+				preflightSignal: expect.any(AbortSignal),
+				onQueuedPromoted: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
+			},
 		],
 	]);
 });
@@ -1843,6 +2418,8 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 				deliverAs: "followUp",
 				preflightSignal: expect.any(AbortSignal),
 				sdkRunCapability: expect.any(Object),
+				onQueuedPromoted: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
 			},
 		],
 	]);
@@ -2765,6 +3342,295 @@ test("SDK host waits for accepted handleless skill settlement before publishing 
 	expect(executionStarted).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+
+function assistantEndEvent(text: string): AgentEndEvent {
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "openai-completions",
+		provider: "fixture-provider",
+		model: "reasoning-model",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+	return { type: "agent_end", messages: [message], stopReason: "completed" };
+}
+
+function acceptedCorrelation(frame: Record<string, unknown> | undefined): { commandId: string; turnId: string } {
+	const result = (frame as { result?: { commandId?: unknown; turnId?: unknown } } | undefined)?.result;
+	if (typeof result?.commandId !== "string" || typeof result.turnId !== "string")
+		throw new Error(`acceptance frame carries no correlation: ${JSON.stringify(frame)}`);
+	return { commandId: result.commandId, turnId: result.turnId };
+}
+
+test("SDK host retains the final assistant text for a skill whose invocation settles before its terminal is finalized", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-result-text-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-result-text-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	// The invocation promise settles only when the test releases it, so the
+	// runtime order (durable claim enqueued, invocation resolves, finalize) is
+	// reproduced deterministically instead of depending on the agent loop.
+	let release = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		await release.promise;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (frame: Record<string, unknown>): Promise<Record<string, unknown> | undefined> => {
+		socket.send(JSON.stringify(frame));
+		await waitFor(() => frames.some(candidate => candidate.id === frame.id), `${String(frame.id)} response`);
+		return frames.find(candidate => candidate.id === frame.id);
+	};
+	const terminalFrame = (correlation: { commandId: string; turnId: string }): Record<string, unknown> | undefined =>
+		frames.find(
+			frame =>
+				frame.type === "agent_end" &&
+				frame.commandId === correlation.commandId &&
+				frame.turnId === correlation.turnId,
+		);
+	const skillText = "skill final answer";
+	const directText = "direct final answer";
+	try {
+		const skill = acceptedCorrelation(
+			await request({
+				type: "control_request",
+				id: "skill-text",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "keep text", clientRef: "skill-text-ref" },
+			}),
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		const skillEnding = handlers.get("agent_end")?.(assistantEndEvent(skillText), sessionContext);
+		release.resolve();
+		await skillEnding;
+		await waitFor(() => terminalFrame(skill) !== undefined, "correlated skill terminal");
+		const skillByClientRef = await request({
+			type: "query_request",
+			id: "skill-text-by-client-ref",
+			query: "turn.result",
+			input: { kind: "skill", clientRef: "skill-text-ref" },
+		});
+		const skillByPair = await request({
+			type: "query_request",
+			id: "skill-text-by-pair",
+			query: "turn.result",
+			input: { kind: "skill", ...skill },
+		});
+
+		const direct = acceptedCorrelation(
+			await request({
+				type: "control_request",
+				id: "direct-text",
+				operation: "turn.prompt",
+				input: { text: "direct", clientRef: "direct-text-ref" },
+			}),
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.(assistantEndEvent(directText), sessionContext);
+		await waitFor(() => terminalFrame(direct) !== undefined, "correlated direct prompt terminal");
+		const directByClientRef = await request({
+			type: "query_request",
+			id: "direct-text-by-client-ref",
+			query: "turn.result",
+			input: { kind: "prompt", clientRef: "direct-text-ref" },
+		});
+
+		release = Promise.withResolvers<void>();
+		const blank = acceptedCorrelation(
+			await request({
+				type: "control_request",
+				id: "skill-blank",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "blank text", clientRef: "skill-blank-ref" },
+			}),
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		const blankEnding = handlers.get("agent_end")?.(assistantEndEvent(" "), sessionContext);
+		release.resolve();
+		await blankEnding;
+		await waitFor(() => terminalFrame(blank) !== undefined, "correlated blank skill terminal");
+		const blankByClientRef = await request({
+			type: "query_request",
+			id: "skill-blank-by-client-ref",
+			query: "turn.result",
+			input: { kind: "skill", clientRef: "skill-blank-ref" },
+		});
+
+		// Event association is intact in both states: the correlated terminal
+		// carries the skill's final text on the wire.
+		expect(terminalFrame(skill)).toMatchObject({
+			finalText: skillText,
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		});
+		// Direct-prompt parity guard: the single-owner prompt path keeps its text.
+		expect(directByClientRef).toMatchObject({
+			ok: true,
+			result: {
+				status: "terminal_ok",
+				receiptState: "present",
+				content: { text: directText, byteLength: new TextEncoder().encode(directText).length, truncated: false },
+			},
+		});
+		// Blank final text keeps the existing missing-receipt semantics.
+		expect(blankByClientRef).toMatchObject({ ok: true, result: { status: "terminal_ok", receiptState: "missing" } });
+		expect((blankByClientRef?.result as { content?: unknown } | undefined)?.content).toBeUndefined();
+		// The durable skill result must carry the bounded final text through both
+		// public selectors.
+		const expectedSkillContent = {
+			text: skillText,
+			byteLength: new TextEncoder().encode(skillText).length,
+			truncated: false,
+		};
+		expect(skillByClientRef).toMatchObject({
+			ok: true,
+			result: { status: "terminal_ok", receiptState: "present", content: expectedSkillContent },
+		});
+		expect(skillByPair).toMatchObject({
+			ok: true,
+			result: { status: "terminal_ok", receiptState: "present", content: expectedSkillContent },
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+});
+test("SDK host retains final text for an ownerless durable skill invocation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ownerless-skill-result-text-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-ownerless-skill-result-text-${Date.now()}`;
+	const ownerlessText = "ownerless durable skill result ✓";
+	const sessionContext = context(cwd, sessionId);
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	sessionContext.invokeSkill = async (
+		name: string,
+		_args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		return ownerlessText;
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const requesterConnectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	let ownerlessControlRequested = false;
+	const asyncLocalStoragePrototype = AsyncLocalStorage.prototype as unknown as {
+		run: (store: unknown, callback: (...args: unknown[]) => unknown, ...args: unknown[]) => unknown;
+	};
+	const nativeAsyncLocalStorageRun = asyncLocalStoragePrototype.run;
+	asyncLocalStoragePrototype.run = function (store, callback, ...args) {
+		if (
+			ownerlessControlRequested &&
+			store === requesterConnectionId &&
+			String(callback).includes("dispatchControl")
+		) {
+			ownerlessControlRequested = false;
+			return callback(...args);
+		}
+		return Reflect.apply(nativeAsyncLocalStorageRun, this, [store, callback, ...args]);
+	};
+	const requestQuery = async (id: string): Promise<Record<string, unknown> | undefined> => {
+		socket.send(
+			JSON.stringify({
+				type: "query_request",
+				id,
+				query: "turn.result",
+				input: { kind: "skill", clientRef: "ownerless-skill-ref" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === id), `${id} response`);
+		return frames.find(frame => frame.id === id);
+	};
+	try {
+		ownerlessControlRequested = true;
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "ownerless-skill",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "ownerless", clientRef: "ownerless-skill-ref" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === "ownerless-skill"), "ownerless skill response");
+		expect(ownerlessControlRequested).toBe(false);
+		expect(frames.find(frame => frame.id === "ownerless-skill")).toMatchObject({
+			type: "control_response",
+			ok: true,
+			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+		});
+
+		let resultResponse: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 100; attempt++) {
+			resultResponse = await requestQuery(`ownerless-skill-result-${attempt}`);
+			const result = resultResponse?.result as { status?: string } | undefined;
+			if (result?.status === "terminal_ok" || result?.status === "failed") break;
+			await Bun.sleep(10);
+		}
+		const byteLength = new TextEncoder().encode(ownerlessText).byteLength;
+		expect(resultResponse).toMatchObject({
+			ok: true,
+			result: {
+				status: "terminal_ok",
+				receiptState: "present",
+				content: { version: 1, type: "text", text: ownerlessText, byteLength, truncated: false },
+			},
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		asyncLocalStoragePrototype.run = nativeAsyncLocalStorageRun;
+	}
+}, 60_000);
 test("SDK host waits for durable prompt acceptance before completing concurrent cancellation", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-durable-accept-cancel-"));
 	dirs.push(cwd);
@@ -3168,10 +4034,14 @@ test("session_shutdown awaits a late reconciliation publication before teardown 
 	expect(
 		frames.find(frame => frame.type === "control_response" && frame.id === "skill-late-publication"),
 	).toMatchObject({ ok: true, result: { accepted: true } });
-	// The acceptance publication has settled; the next commit to this store file
-	// is the late fire-and-forget agent_end transition. Arm the pause, then let
-	// the run resolve so that publication starts and is held mid-rename.
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	// The acceptance and agent_start publications have settled; the next commit
+	// to this store file is the correlated agent_end terminal claim, the sole
+	// terminal owner of a lifecycle-owned skill. Arm the pause, deliver the
+	// terminal, then let the run resolve so that publication starts and is
+	// held mid-rename.
 	pausedCommit.arm();
+	void handlers.get("agent_end")?.(assistantEndEvent("held"), sessionContext);
 	resumeExecution.resolve();
 	await pausedCommit.started;
 	// Teardown must not report the session stopped while a durable publication it
@@ -3339,9 +4209,11 @@ test("session_shutdown bounds a hung reconciliation publication and reports the 
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-drain-deadline"),
 			"accepted skill response",
 		);
-		// The publication is armed and held mid-rename; shutdown begins with the
-		// rename still never released.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		// The correlated agent_end terminal claim is armed and held mid-rename;
+		// shutdown begins with the rename still never released.
 		pausedCommit.arm();
+		void handlers.get("agent_end")?.(assistantEndEvent("held"), sessionContext);
 		resumeExecution.resolve();
 		await pausedCommit.started;
 		const shutdownStarted = Date.now();
@@ -3428,11 +4300,15 @@ test("session_shutdown propagates a rejected reconciliation publication without 
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-publish-failure"),
 			"accepted skill response",
 		);
-		// The acceptance write has committed; the NEXT commit is the terminal
-		// agent_end publication, and it is made to fail at its atomic rename.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		// The acceptance and agent_start writes have committed; the NEXT commit is
+		// the correlated agent_end terminal claim, and it is made to fail at its
+		// atomic rename.
 		failedCommit.arm();
+		const ending = handlers.get("agent_end")?.(assistantEndEvent("lost"), sessionContext);
 		resumeExecution.resolve();
 		await failedCommit.failed;
+		await ending;
 		const shutdownFailure = await Promise.resolve(
 			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
 		).then(
@@ -3521,13 +4397,26 @@ test("a recovered reconciliation publication lets a later teardown drain report 
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-recovery-first"),
 			"first accepted skill response",
 		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 		failedCommit.arm();
+		const firstEnding = handlers.get("agent_end")?.(assistantEndEvent("lost"), sessionContext);
 		resumeFirst.resolve();
 		await failedCommit.failed;
+		await firstEnding;
+		// The failed terminal claim fenced its requester connection (fail closed,
+		// as for prompts), so the later publication comes from a fresh connection.
 		// The failure window closes with the failing publication; the store is
 		// writable again, so a subsequent publication persists and the teardown
 		// drain reports quiescence rather than staying poisoned by the past failure.
-		socket.send(
+		const secondFrames: Record<string, unknown>[] = [];
+		const secondSocket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(secondSocket);
+		secondSocket.addEventListener("message", event => secondFrames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			secondSocket.addEventListener("open", () => resolve(), { once: true });
+			secondSocket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		secondSocket.send(
 			JSON.stringify({
 				type: "control_request",
 				id: "skill-recovery-second",
@@ -3536,9 +4425,14 @@ test("a recovered reconciliation publication lets a later teardown drain report 
 			}),
 		);
 		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-recovery-second"),
+			() => secondFrames.some(frame => frame.type === "control_response" && frame.id === "skill-recovery-second"),
 			"second accepted skill response",
 		);
+		expect(
+			secondFrames.find(frame => frame.type === "control_response" && frame.id === "skill-recovery-second"),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.(assistantEndEvent("recovered"), sessionContext);
 		// The first teardown still reports the earlier lost write: a publication that
 		// never reached disk is state loss even though a later one succeeded, and
 		// evidence is retained until an owner is actually told about it.

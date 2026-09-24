@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Added
+
+- Add default/executor/planner/architect/critic usage totals to the stats summary and JSON output, attributing existing persisted subagent identities and leaving legacy sessions without identity metadata as `unknown`.
+
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Fixed
+
+- Preserve historical assistant session entries that omit `stopReason` when syncing `gjc stats`.
+
+- Keep stats synchronization working when historical assistant entries contain partial cost data or malformed required metadata. Preserve finite recorded costs, estimate missing costs with existing catalog pricing, and skip malformed entries without changing source transcripts.
+- Preserve recorded nonzero cost components with a zero total when reopening the stats database, and allow request-detail lookup past malformed JSONL entries.
+
+## [0.17.2] - 2026-09-18
+
 ## [0.17.1] - 2026-09-17
 
 ## [0.17.0] - 2026-09-17

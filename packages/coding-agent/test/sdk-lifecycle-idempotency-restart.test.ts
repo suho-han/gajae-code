@@ -1,14 +1,69 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { Broker } from "../src/sdk/broker/broker";
+import { deriveIdempotencyIdentity, deriveLegacyIdentity } from "../src/sdk/broker/identity";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 
 function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
 	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
 }
 
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
+
 describe("SDK lifecycle ledger", () => {
+	it("migrates a terminal v3 identity before replaying it after a broker restart", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-v3-replay-"));
+		const operation = "session.close";
+		const requestKey = "sdk:session-cli:session.close:legacy-session:1:legacy-incarnation";
+		const input = {
+			sessionId: "legacy-session",
+			endpointGeneration: 1,
+			endpointIncarnation: "a".repeat(64),
+		};
+		const fingerprint = lifecycleFingerprint(operation, input);
+		const requestHash = createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
+		const targetHash = createHash("sha256").update(canonicalJson(input)).digest("hex");
+		const operationKey = `${operation}\0${requestKey}`;
+		const legacyIdentity = await deriveLegacyIdentity(dir, operation, requestKey);
+		const currentIdentity = await deriveIdempotencyIdentity(dir, operation, requestKey, targetHash);
+		const response = { ok: true as const, operation, result: { sessionId: input.sessionId } };
+		const first = new Broker({ agentDir: dir });
+		const second = new Broker({ agentDir: dir });
+		try {
+			await first.start();
+			await first.ledger.begin(legacyIdentity, requestHash, { operationKey, fingerprint });
+			await first.ledger.transition(legacyIdentity, "terminal_ok", { response });
+			await first.stop();
+
+			await second.start();
+			await expect(second.handleRequest(operation, input, requestKey)).resolves.toEqual(response);
+			await expect(second.handleRequest(operation, input, requestKey)).resolves.toEqual(response);
+			await second.stop();
+
+			const reopened = await new LifecycleLedger(dir).open();
+			expect(reopened.get(currentIdentity)).toMatchObject({
+				state: "terminal_ok",
+				operationKey,
+				fingerprint,
+			});
+		} finally {
+			await first.stop().catch(() => {});
+			await second.stop().catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("replays terminal responses and rejects conflicts across restarts", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-"));
 		const ledger = await new LifecycleLedger(dir).open();
@@ -145,12 +200,12 @@ describe("SDK lifecycle ledger", () => {
 		const verifier = new LifecycleLedger(dir);
 
 		await expect(verifier.readTerminal("first", "first-request")).resolves.toMatchObject({
-			state: "terminal_ok",
-			response: { sessionId: "first" },
+			kind: "terminal",
+			entry: { state: "terminal_ok", response: { sessionId: "first" } },
 		});
 		await expect(verifier.readTerminal("second", "second-request")).resolves.toMatchObject({
-			state: "terminal_ok",
-			response: { sessionId: "second" },
+			kind: "terminal",
+			entry: { state: "terminal_ok", response: { sessionId: "second" } },
 		});
 		expect(await fs.readFile(ledgerPath, "utf8")).toBe(before);
 		expect(await fs.stat(`${ledgerPath}.corrupt`).catch(() => undefined)).toBeUndefined();
@@ -164,7 +219,12 @@ describe("SDK lifecycle ledger", () => {
 		await ledger.transition("target", "terminal_ok", { response: { sessionId: "target" } });
 		const terminalSource = await fs.readFile(ledgerPath, "utf8");
 		await fs.writeFile(ledgerPath, terminalSource.slice(0, -1));
-		await expect(new LifecycleLedger(dir).readTerminal("target", "request")).resolves.toBeUndefined();
+		// A truncated final row for this identity is a *rejected* read-back, not absence:
+		// something is recorded for the request and the ledger refused it.
+		await expect(new LifecycleLedger(dir).readTerminal("target", "request")).resolves.toEqual({
+			kind: "rejected",
+			reason: "partial-row",
+		});
 
 		const conflictingDir = await fs.mkdtemp(
 			path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-terminal-conflict-"),
@@ -183,7 +243,122 @@ describe("SDK lifecycle ledger", () => {
 				.map(row => `${JSON.stringify(row)}\n`)
 				.join(""),
 		);
-		await expect(new LifecycleLedger(conflictingDir).readTerminal("target", "request")).resolves.toBeUndefined();
+		// A row whose digest does not attribute it to this request is likewise rejected.
+		await expect(new LifecycleLedger(conflictingDir).readTerminal("target", "request")).resolves.toEqual({
+			kind: "rejected",
+			reason: "row-not-attributable",
+		});
+	});
+
+	it("returns absent for a missing or empty regular ledger", async () => {
+		const absentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-absent-"));
+		const emptyDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-empty-"));
+		try {
+			await expect(new LifecycleLedger(absentDir).readTerminal("target", "request")).resolves.toEqual({
+				kind: "absent",
+			});
+
+			const emptyPath = path.join(emptyDir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.mkdir(path.dirname(emptyPath), { recursive: true });
+			await fs.writeFile(emptyPath, "");
+			await expect(new LifecycleLedger(emptyDir).readTerminal("target", "request")).resolves.toEqual({
+				kind: "absent",
+			});
+		} finally {
+			await fs.rm(absentDir, { recursive: true, force: true });
+			await fs.rm(emptyDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a non-regular ledger path with a named source reason", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-nonregular-"));
+		try {
+			await fs.mkdir(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), { recursive: true });
+			await expect(new LifecycleLedger(dir).readTerminal("target", "request")).resolves.toEqual({
+				kind: "rejected",
+				reason: "not-regular-file",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a writerless FIFO without blocking the terminal read", async () => {
+		if (process.platform === "win32") return;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-fifo-"));
+		const fifoPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+		try {
+			await fs.mkdir(path.dirname(fifoPath), { recursive: true });
+			const mkfifo = Bun.spawn(["mkfifo", fifoPath]);
+			expect(await mkfifo.exited).toBe(0);
+
+			const result = await Promise.race([
+				new LifecycleLedger(dir).readTerminal("target", "request"),
+				Bun.sleep(1_000).then(() => "timeout" as const),
+			]);
+			if (result === "timeout") throw new Error("FIFO terminal read blocked past the bounded timeout");
+			expect(result).toEqual({
+				kind: "rejected",
+				reason: "not-regular-file",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a stat-oversized ledger with oversized-by-stat", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-stat-"));
+		try {
+			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.mkdir(path.dirname(ledgerPath), { recursive: true });
+			await fs.writeFile(ledgerPath, "12");
+			await expect(new LifecycleLedger(dir, { maxBytes: 1 }).readTerminal("target", "request")).resolves.toEqual({
+				kind: "rejected",
+				reason: "oversized-by-stat",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a read-oversized ledger with oversized-by-read", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-read-"));
+		const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+		await fs.mkdir(path.dirname(ledgerPath), { recursive: true });
+		await fs.writeFile(ledgerPath, "1");
+		const originalOpen = fs.open;
+		const restoreReads: Array<() => void> = [];
+		const openSpy = spyOn(fs, "open").mockImplementation(async (filePath, flags, mode) => {
+			const handle = await originalOpen(filePath, flags, mode);
+			if (filePath === ledgerPath) {
+				const readSpy = spyOn(handle, "read").mockResolvedValue({ buffer: Buffer.alloc(2), bytesRead: 2 });
+				restoreReads.push(() => readSpy.mockRestore());
+			}
+			return handle;
+		});
+		try {
+			await expect(new LifecycleLedger(dir, { maxBytes: 1 }).readTerminal("target", "request")).resolves.toEqual({
+				kind: "rejected",
+				reason: "oversized-by-read",
+			});
+		} finally {
+			openSpy.mockRestore();
+			for (const restore of restoreReads) restore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a non-ENOENT ledger read failure with read-error", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-error-"));
+		try {
+			await fs.writeFile(path.join(dir, "sdk"), "not a directory");
+			await expect(new LifecycleLedger(dir).readTerminal("target", "request")).resolves.toEqual({
+				kind: "rejected",
+				reason: "read-error",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -292,8 +467,17 @@ describe("SDK lifecycle ledger history validation", () => {
 		const ledger = await new LifecycleLedger(dir).open();
 		expect(await ledger.begin("cleanup", "request")).toMatchObject({ kind: "terminal_uncertain" });
 		expect(await ledger.begin("terminal", "request")).toMatchObject({ kind: "terminal_uncertain" });
-		await expect(new LifecycleLedger(dir).readTerminal("cleanup", "request")).resolves.toBeUndefined();
-		await expect(new LifecycleLedger(dir).readTerminal("terminal", "request")).resolves.toBeUndefined();
+		// Quarantined standalone cleanup authority fails history continuation, so both
+		// identities read back as rejected rather than absent. That is the distinction
+		// this change exists to keep: the fence stays raised for a damaged ledger.
+		await expect(new LifecycleLedger(dir).readTerminal("cleanup", "request")).resolves.toEqual({
+			kind: "rejected",
+			reason: "row-not-attributable",
+		});
+		await expect(new LifecycleLedger(dir).readTerminal("terminal", "request")).resolves.toEqual({
+			kind: "rejected",
+			reason: "row-not-attributable",
+		});
 		expect(await fs.readFile(ledgerPath, "utf8")).toBe(source);
 		expect(await fs.readFile(`${ledgerPath}.corrupt`, "utf8")).toContain('"effect_started"');
 	});

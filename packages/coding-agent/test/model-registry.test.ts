@@ -7,6 +7,7 @@ import {
 	type Api,
 	type Context,
 	Effort,
+	getBundledModels,
 	getSupportedEfforts,
 	type Model,
 	type OpenAICompat,
@@ -302,6 +303,19 @@ describe("ModelRegistry", () => {
 		});
 	}
 
+	function configuredDiscoveryProvenance(authEvidence: string, endpoint: string, api: Api): string {
+		const context = JSON.stringify({
+			authEvidence,
+			endpoint,
+			headers: [],
+			discoveryType: "openai-models-list",
+			api,
+			apiByModelPrefix: [],
+			modelsDevProvider: "",
+		});
+		return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
+	}
+
 	function mockOllamaDiscovery(modelNames: string[]) {
 		return hookFetch(input => {
 			const url = String(input);
@@ -392,6 +406,63 @@ describe("ModelRegistry", () => {
 				expect(
 					getModelsForProvider(registry, "openai").every(model => model.baseUrl === Bun.env.OPENAI_BASE_URL),
 				).toBe(true);
+			} finally {
+				restore();
+			}
+		});
+
+		test("getProviderBaseUrl follows the catalog after a models config reload", async () => {
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://first.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://first.example.com/v1");
+
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://second.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			await registry.refresh("offline");
+
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://second.example.com/v1");
+			expect(registry.getProviderBaseUrl("no-such-provider")).toBeUndefined();
+		});
+
+		test("getProviderBaseUrl reflects in-place changes to the catalog returned by getAll()", () => {
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://first.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://first.example.com/v1");
+			// `getAll()` exposes the live catalog to extensions; lookups must not be served
+			// from a snapshot taken before an in-place edit.
+			const model = registry.getAll().find(candidate => candidate.provider === "base-url-proxy");
+			if (!model) throw new Error("proxy model missing");
+			model.baseUrl = "https://edited.example.com/v1";
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://edited.example.com/v1");
+		});
+
+		test("getProviderBaseUrl env fallback still applies to providers without a catalog base URL", () => {
+			const restore = setEnvForTest("MY_LATE_PROXY_BASE_URL", "https://late.example.com/v1");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getProviderBaseUrl("my-late-proxy")).toBe("https://late.example.com/v1");
+				Bun.env.MY_LATE_PROXY_BASE_URL = "https://later.example.com/v1";
+				expect(registry.getProviderBaseUrl("my-late-proxy")).toBe("https://later.example.com/v1");
 			} finally {
 				restore();
 			}
@@ -826,7 +897,7 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const opusVariants = registry.getCanonicalVariants("claude-opus-5");
+			const opusVariants = registry.getCanonicalVariants("claude-opus-5-5");
 			const haikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
 
 			expect(opusVariants.some(variant => variant.selector === "demo/anthropic/claude-opus-latest")).toBe(true);
@@ -1152,6 +1223,66 @@ describe("ModelRegistry", () => {
 			expect(registry.getAvailable()).not.toBe(initial);
 		});
 
+		test("uses successful LiteLLM discovery as authoritative for available models", async () => {
+			const liveIds = ["openai/gpt-5.4", "proxy-only-model"];
+			const bundledIds = getBundledModels("litellm").map(model => model.id);
+			expect(bundledIds).toContain("openai/gpt-5.4");
+			expect(bundledIds).toContain("abacusai/Dracarys-72B-Instruct");
+			writeRawModelsJson({
+				litellm: {
+					baseUrl: "http://localhost:4000/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+				},
+			});
+
+			using _hook = mockOpenAiCompatibleModels("http://localhost:4000/v1/models", liveIds);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated());
+			try {
+				await registry.refreshProvider("litellm", "online");
+
+				const availableIds = registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id)
+					.sort();
+				expect(availableIds).toEqual([...liveIds].sort());
+			} finally {
+				await registry.dispose();
+			}
+		});
+
+		test("falls back to the bundled LiteLLM catalog when discovery is unavailable", async () => {
+			const bundledIds = getBundledModels("litellm").map(model => model.id);
+			writeRawModelsJson({
+				litellm: {
+					baseUrl: "http://localhost:4000/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+				},
+			});
+			using _hook = hookFetch(input => {
+				const requestUrl = String(input);
+				if (requestUrl === "http://localhost:4000/v1/models") {
+					return new Response("proxy unavailable", { status: 503 });
+				}
+				throw new Error(`Unexpected URL: ${requestUrl}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated());
+			try {
+				await registry.refreshProvider("litellm", "online");
+
+				const availableIds = registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id)
+					.sort();
+				expect(availableIds).toEqual([...bundledIds].sort());
+			} finally {
+				await registry.dispose();
+			}
+		});
+
 		test("invalidates available models when a runtime API-key override is set", async () => {
 			await Settings.init({ inMemory: true });
 			const previous = process.env.XAI_API_KEY;
@@ -1448,7 +1579,7 @@ describe("ModelRegistry", () => {
 			});
 			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {
 				availableOnly: false,
-				candidates: registry.getAll().reverse(),
+				candidates: registry.getAll().slice().reverse(),
 				sessionId: "sticky-session",
 			});
 			expect(resolved).toBe(initial);
@@ -3345,6 +3476,51 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("http://127.0.0.1:8080");
 		});
 
+		test.each([
+			["opencode-go", "https://opencode.ai/zen/go"],
+			["opencode-zen", "https://opencode.ai/zen"],
+		] as const)("%s Union Alpha survives production discovery and offline registry reload", async (provider, baseUrl) => {
+			authStorage.setRuntimeApiKey(provider, "union-test-key");
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				const url = input instanceof Request ? input.url : String(input);
+				if (url !== `${baseUrl}/v1/models`) throw new Error(`Unexpected discovery URL: ${url}`);
+				requests++;
+				return Response.json({ data: [{ id: "union-alpha" }] });
+			});
+			const registrySettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			const expected = {
+				id: "union-alpha",
+				provider,
+				name: "Union Alpha Free",
+				api: "anthropic-messages",
+				baseUrl,
+				contextWindow: 262_144,
+				maxTokens: 131_072,
+				input: ["text", "image"],
+				reasoning: true,
+			};
+			try {
+				await registry.refreshProvider(provider, "online");
+				expect(requests).toBe(1);
+				expect(registry.find(provider, "union-alpha")).toMatchObject(expected);
+				expect(readModelCache(provider, 86_400_000, Date.now, cacheDbPath)?.dynamicModelIds).toEqual([
+					"union-alpha",
+				]);
+			} finally {
+				registry.dispose();
+			}
+			const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			try {
+				await reloaded.refreshProvider(provider, "offline");
+				expect(reloaded.find(provider, "union-alpha")).toMatchObject(expected);
+				expect(requests).toBe(1);
+			} finally {
+				reloaded.dispose();
+			}
+		});
+
 		test("discoverable custom compat survives refresh", async () => {
 			writeRawModelsJson({
 				openai: {
@@ -3479,6 +3655,44 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
 		});
 
+		test("explicit model definitions remain authoritative over same-id discovery", async () => {
+			writeRawModelsJson({
+				"explicit-discovery": {
+					baseUrl: "https://provider.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					models: [
+						{
+							id: "explicit-model",
+							name: "Configured model",
+							contextWindow: 123_456,
+							maxTokens: 7_654,
+						},
+					],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			using _hook = hookFetch(
+				() =>
+					new Response(
+						JSON.stringify({ data: [{ id: "explicit-model", owned_by: "anthropic" }, { id: "live-model" }] }),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					),
+			);
+			await registry.refreshProvider("explicit-discovery", "online");
+
+			expect(registry.find("explicit-discovery", "explicit-model")).toMatchObject({
+				api: "openai-responses",
+				name: "Configured model",
+				contextWindow: 123_456,
+				maxTokens: 7_654,
+			});
+			expect(registry.find("explicit-discovery", "live-model")).toBeDefined();
+		});
+
 		test("newly discovered ids inherit provider fields, not another model's custom fields", async () => {
 			writeRawModelsJson({
 				openai: {
@@ -3512,7 +3726,14 @@ describe("ModelRegistry", () => {
 			await addApiCompatibleProvider({ preset: "minimax", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "cline-pass", modelsPath: presetModelsPath });
-			await addApiCompatibleProvider({ preset: "commandcode-goat", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({
+				preset: "commandcode-goat",
+				modelsPath: presetModelsPath,
+				probeDiscovery: async () => ({
+					models: ["goat-model"],
+					endpoint: "https://api.commandcode.ai/provider/v1/models",
+				}),
+			});
 			authStorage.setRuntimeApiKey("commandcode-goat", "test-key");
 
 			using _hook = hookFetch(input => {
@@ -6861,6 +7082,197 @@ describe("ModelRegistry", () => {
 			expect(trackedRows()).toEqual([]);
 		});
 
+		test("publishes fresh authoritative LiteLLM cache evidence without a models-list request", async () => {
+			const modelId = "viant-gemini-3-8-flash";
+			const endpoint = "http://localhost:4000/v1";
+			const cachedModel: Model<"openai-completions"> = {
+				id: modelId,
+				name: modelId,
+				api: "openai-completions",
+				provider: "litellm",
+				baseUrl: endpoint,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			authStorage.setRuntimeApiKey("litellm", "cached-litellm-key");
+			writeRawModelsJson({
+				litellm: {
+					baseUrl: endpoint,
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const provenance = configuredDiscoveryProvenance(
+				authStorage.getProviderEvidenceGeneration("litellm", "cached-litellm-key"),
+				endpoint,
+				"openai-completions",
+			);
+			writeModelCache("litellm", Date.now(), [cachedModel], true, "", cacheDbPath, [modelId], provenance);
+
+			let modelsListRequests = 0;
+			using _hook = hookFetch(input => {
+				modelsListRequests++;
+				throw new Error(`unexpected models-list request: ${String(input)}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), {
+				automaticRefresh: false,
+			});
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id),
+			).toContain(modelId);
+			await registry.refreshProvider("litellm", "online-if-uncached");
+
+			expect(modelsListRequests).toBe(0);
+			expect(registry.getProviderDiscoveryState("litellm")).toMatchObject({
+				status: "ok",
+				stale: false,
+				fetchedAt: expect.any(Number),
+				models: [modelId],
+			});
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id),
+			).toContain(modelId);
+			await registry.dispose();
+		});
+
+		test("retains fresh authoritative empty discovery evidence after online-if-uncached refresh", async () => {
+			const provider = "openai";
+			const endpoint = "http://127.0.0.1:1234/v1";
+			authStorage.setRuntimeApiKey(provider, "empty-openai-discovery-key");
+			writeRawModelsJson({
+				openai: {
+					baseUrl: endpoint,
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const provenance = configuredDiscoveryProvenance(
+				authStorage.getProviderEvidenceGeneration(provider, "empty-openai-discovery-key"),
+				endpoint,
+				"openai-responses",
+			);
+			writeModelCache(provider, Date.now(), [], true, "", cacheDbPath, [], provenance);
+
+			const bundledModel = getBundledModels(provider)[0];
+			if (!bundledModel) throw new Error("Expected a bundled OpenAI model");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), {
+				automaticRefresh: false,
+			});
+			const hasAvailableOpenAiModel = () =>
+				registry.getAvailable().some(model => model.provider === provider && model.id === bundledModel.id);
+			expect(hasAvailableOpenAiModel()).toBe(false);
+
+			let modelsListRequests = 0;
+			using _hook = hookFetch(() => {
+				modelsListRequests++;
+				throw new Error("fresh authoritative empty cache must not make a models-list request");
+			});
+			await registry.refreshProvider(provider, "online-if-uncached");
+
+			expect(modelsListRequests).toBe(0);
+			expect(registry.getProviderDiscoveryState(provider)).toMatchObject({
+				status: "empty",
+				stale: false,
+				models: [],
+				fetchedAt: expect.any(Number),
+			});
+			expect(hasAvailableOpenAiModel()).toBe(false);
+			await registry.dispose();
+		});
+
+		test("does not mutate configured discovery evidence during stored-credential cache validation", async () => {
+			const modelId = "stored-litellm-model";
+			const endpoint = "http://localhost:4000/v1";
+			const cachedModel: Model<"openai-completions"> = {
+				id: modelId,
+				name: modelId,
+				api: "openai-completions",
+				provider: "stored-discovery",
+				baseUrl: endpoint,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			await authStorage.set("stored-discovery", [{ type: "api_key", key: "stored-discovery-key" }]);
+			writeRawModelsJson({
+				"stored-discovery": {
+					baseUrl: endpoint,
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const provenance = configuredDiscoveryProvenance(
+				authStorage.getProviderEvidenceGeneration("stored-discovery", "stored-discovery-key"),
+				endpoint,
+				"openai-completions",
+			);
+			writeModelCache("stored-discovery", Date.now(), [cachedModel], true, "", cacheDbPath, [modelId], provenance);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), {
+				automaticRefresh: false,
+			});
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "stored-discovery")
+					.map(model => model.id),
+			).not.toContain(modelId);
+			{
+				using _cacheHook = hookFetch(input => {
+					throw new Error(`unexpected cache-validation request: ${String(input)}`);
+				});
+				await registry.refreshProvider("stored-discovery", "online-if-uncached");
+			}
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "stored-discovery")
+					.map(model => model.id),
+			).toContain(modelId);
+			expect(activeRowsFor(registry, ["stored-discovery"])).toEqual([
+				{ provider: "stored-discovery", connectionKind: "credential" },
+			]);
+
+			using _hook = hookFetch(() => {
+				throw new Error("configured discovery unavailable");
+			});
+			await registry.refreshProvider("stored-discovery", "online");
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "stored-discovery")
+					.map(model => model.id),
+			).toContain(modelId);
+			expect(activeRowsFor(registry, ["stored-discovery"])).toEqual([]);
+
+			// Restore the valid row after the failed online probe. The model remains
+			// in the merged catalog, but this exact credential-scoped read is
+			// observational and must not restore configured discovery authority.
+			writeModelCache("stored-discovery", Date.now(), [cachedModel], true, "", cacheDbPath, [modelId], provenance);
+			const credential = authStorage
+				.exportSnapshot()
+				.credentials.find(entry => entry.provider === "stored-discovery");
+			expect(credential).toBeDefined();
+			expect(
+				registry.validateModelForStoredLiteralCredential("stored-discovery", modelId, {
+					kind: "id",
+					value: String(credential!.id),
+				}),
+			).toBe(true);
+			expect(activeRowsFor(registry, ["stored-discovery"])).toEqual([]);
+			await registry.dispose();
+		});
+
 		test("does not advertise a fresh configured-discovery cache reused without a probe", async () => {
 			const cachedModel: Model<"openai-responses"> = {
 				id: "cached-model",
@@ -8833,7 +9245,8 @@ describe("ModelRegistry", () => {
 			]);
 
 			await registry.refreshProvider("discovery-provider", "online");
-			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("empty");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("unavailable");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.error).toContain("returned no models");
 			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
 				{ provider: "mixed", connectionKind: "credentialless" },
 			]);
@@ -8888,7 +9301,8 @@ describe("ModelRegistry", () => {
 			hasModels = false;
 			await registry.refreshProvider("credentialless-discovery", "online");
 
-			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("empty");
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("cached");
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.error).toContain("returned no models");
 			expect(registry.find("credentialless-discovery", "discovered-model")).toBeDefined();
 			expect(activeRowsFor(registry, ["credentialless-discovery"])).toEqual([]);
 		});

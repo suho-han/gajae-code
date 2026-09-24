@@ -66,9 +66,12 @@ import {
 } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
+import { steerFoldReasonLine, watchSteerForFold } from "./steer-fold";
 import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
+
+export { STEER_FOLD_GRACE_MS, steerFoldReasonLine } from "./steer-fold";
 
 function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string {
 	if (offsetBytes <= 0) return text;
@@ -86,24 +89,20 @@ function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
 export const BASH_DEFAULT_PREVIEW_LINES = 10;
-/**
- * A user steer folds a running foreground bash call only after it has been
- * running at least this long. Shorter commands finish normally and the steer is
- * consumed at the ordinary tool boundary, so a quick `git status` never turns
- * into a background job plus a wake-up turn.
- */
-export const STEER_FOLD_GRACE_MS = 2_000;
-
-/** Model-facing line appended to a steer-folded background-start result. */
-export function steerFoldReasonLine(jobId: string): string {
-	return `Folded into background job ${jobId} because a user steer arrived; the command keeps running with its original timeout and its result will wake a later turn.`;
-}
-
 const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
 const MASTER_OWNER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
+const COORDINATOR_ONLY_BASH_ENV = [
+	"GJC_COORDINATOR_SESSION_STATE_FILE",
+	"GJC_COORDINATOR_SESSION_ID",
+	"GJC_COORDINATOR_SESSION_BRANCH",
+	"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+	"GJC_COORDINATOR_SESSION_READINESS_FILE",
+	"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
+	"GJC_COORDINATOR_SIDECAR_KEY_ID",
+] as const;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const ACP_RELEASE_TIMEOUT_MS = 1_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
@@ -481,12 +480,50 @@ export async function saveBashOriginalArtifactForTests(
 	return result.status === "saved" ? result.artifactId : undefined;
 }
 
+/**
+ * Model-declared activity metadata for the browser-backend routing contract
+ * (`browser.backend: aside`). When that contract routes a browser task through
+ * Bash, it requires the call to declare the activity structurally so consumers
+ * can project it without parsing the command text. The declaration is
+ * model-declared and schema-validated only: nothing here verifies that the
+ * command actually invokes Aside, and the executor never inspects `command`.
+ */
+export type BashActivityProvider = "aside";
+export type BashActivityMode = "repl" | "exec";
+export interface BashActivityDeclaration {
+	kind: "browser";
+	provider: BashActivityProvider;
+	mode: BashActivityMode;
+}
+
+const bashActivityDeclarationSchema = z
+	.object({
+		kind: z.literal("browser"),
+		provider: z.literal("aside"),
+		mode: z.enum(["repl", "exec"]),
+	})
+	.strict();
+
+/**
+ * Optional activity declaration. Anything that is not the exact supported
+ * shape is dropped rather than failing the call: the declaration is routing
+ * metadata, and a malformed value must never make an otherwise valid command
+ * unusable. Values are never coerced — `mode: "EXEC"` is dropped, not guessed.
+ */
+const optionalBashActivity = z
+	.preprocess(
+		value => (bashActivityDeclarationSchema.safeParse(value).success ? value : undefined),
+		bashActivityDeclarationSchema.optional(),
+	)
+	.describe("declare browser activity for the aside browser backend: repl or exec");
+
 const bashSchemaBase = z.object({
 	command: z.string().describe("command to execute"),
 	env: z.record(z.string().regex(BASH_ENV_NAME_PATTERN), z.string()).optional().describe("extra env vars"),
 	timeout: z.number().default(300).describe("timeout in seconds, NOT milliseconds (30 = 30s)").optional(),
 	cwd: z.string().describe("working directory").optional(),
 	pty: z.boolean().describe("run in pty mode").optional(),
+	activity: optionalBashActivity,
 });
 
 const bashSchemaWithAsync = bashSchemaBase.extend({
@@ -503,6 +540,8 @@ export interface BashToolInput {
 
 	async?: boolean;
 	pty?: boolean;
+	/** Accepted activity declaration, mirrored into {@link BashToolDetails.activity}. */
+	activity?: BashActivityDeclaration;
 }
 
 export interface BashToolDetails {
@@ -512,6 +551,8 @@ export interface BashToolDetails {
 	terminalId?: string;
 	/** Why the foreground wait was folded, when this result is a background-start after a fold. */
 	foldReason?: FoldReason;
+	/** The accepted model-declared activity declaration, when the call carried one. */
+	activity?: BashActivityDeclaration;
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;
@@ -924,6 +965,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			notices?: readonly string[];
 			terminalId?: string;
 			artifactReferenceInBody?: boolean;
+			activity?: BashActivityDeclaration;
 		} = {},
 	): AgentToolResult<BashToolDetails> {
 		const shortArtifactInBody = !result.truncated && result.artifactId !== undefined;
@@ -947,6 +989,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (options.terminalId !== undefined) {
 			details.terminalId = options.terminalId;
 		}
+		if (options.activity !== undefined) {
+			details.activity = options.activity;
+		}
 		const resultBuilder = toolResult(details)
 			.text(outputText)
 			.truncationFromSummary(result, {
@@ -967,6 +1012,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			notices?: readonly string[];
 			terminalId?: string;
 			foldReason?: FoldReason;
+			activity?: BashActivityDeclaration;
 		} = {},
 	): AgentToolResult<BashToolDetails> {
 		const details: BashToolDetails = {
@@ -980,6 +1026,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			details.requestedTimeoutSeconds = options.requestedTimeoutSec;
 		}
 		if (options.foldReason !== undefined) details.foldReason = options.foldReason;
+		if (options.activity !== undefined) details.activity = options.activity;
 		const lines: string[] = [];
 		const trimmedPreview = previewText.trimEnd();
 		if (trimmedPreview.length > 0) {
@@ -1013,12 +1060,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		notices?: readonly string[];
 
 		resolvedEnv?: Record<string, string>;
+		unsetEnv: string[];
 		directMasterSpawn: boolean;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
 		onCompletion?: () => void;
 		/** Immutable attempt-scoped tool call id, when executed via a tool call. */
 		toolCallId?: string;
+		/** Accepted activity declaration, mirrored into job progress and result details. */
+		activity?: BashActivityDeclaration;
 	}): ManagedBashJobHandle {
 		const manager = this.#resolveOwnedJobManager();
 		if (!manager) {
@@ -1032,12 +1082,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: options.command;
 		let latestText = "";
 		let backgrounded = options.startBackgrounded;
+		const activityDetails = options.activity === undefined ? {} : { activity: options.activity };
 		const runningDetails = (jobId: string): Record<string, unknown> | undefined =>
-			backgrounded ? { async: { state: "running", jobId, type: "bash" } } : undefined;
+			backgrounded ? { async: { state: "running", jobId, type: "bash" }, ...activityDetails } : undefined;
 		const completedDetails = (jobId: string): Record<string, unknown> | undefined =>
-			backgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined;
+			backgrounded ? { async: { state: "completed", jobId, type: "bash" }, ...activityDetails } : undefined;
 		const failedDetails = (jobId: string): Record<string, unknown> | undefined =>
-			backgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined;
+			backgrounded ? { async: { state: "failed", jobId, type: "bash" }, ...activityDetails } : undefined;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
 
 		const jobId = manager.register(
@@ -1067,6 +1118,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								timeout: options.timeoutMs,
 								signal: runSignal,
 								env: options.resolvedEnv,
+								unsetEnv: options.unsetEnv,
 								artifactPath,
 								artifactId,
 								artifactPublisher,
@@ -1088,6 +1140,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						requestedTimeoutSec: options.requestedTimeoutSec,
 						notices: options.notices,
 						artifactReferenceInBody: true,
+						activity: options.activity,
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
@@ -1110,7 +1163,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					latestText = text;
 					await options.onUpdate?.({
 						content: [{ type: "text", text }],
-						details: backgrounded ? ((details ?? {}) as BashToolDetails) : {},
+						// Backgrounded frames carry the job details verbatim; a foreground
+						// frame has no job facts, but the activity declaration is per-call
+						// metadata and stays attached so partial results are self-describing.
+						details: backgrounded ? ((details ?? {}) as BashToolDetails) : (activityDetails as BashToolDetails),
 					});
 				},
 			},
@@ -1153,62 +1209,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const endpointId = this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined;
 		if (this.session.getAsyncJobManager) return this.session.getAsyncJobManager();
 		return AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
-	}
-
-	/**
-	 * Whether a queued user steer may fold the running foreground wait. Mirrors
-	 * the loop's steer admission: `busyPromptMode=queue` never admits a steer
-	 * into the busy run, so it never folds. `toolInterruptPolicy` is
-	 * deliberately NOT a gate: `finish_tools` means "do not kill the batch to
-	 * deliver a steer", and a fold kills nothing. It is the one way to deliver
-	 * the steer now AND let the command finish, so it applies under both
-	 * policies; the policy only decides what the loop does with sibling tools
-	 * after the fold returns. The auto-background setting is likewise not
-	 * consulted: like the chord, a steer fold is a user action.
-	 *
-	 * Fails closed: a session that cannot report newly admitted steering or
-	 * accept a fold request is not steer-foldable.
-	 */
-	#steerFoldEnabled(): boolean {
-		const { waitForUserSteering, requestForegroundBashBackground } = this.session;
-		if (!waitForUserSteering || !requestForegroundBashBackground) return false;
-		return this.session.settings.get("busyPromptMode") === "steer";
-	}
-
-	/**
-	 * Fold `adapter` on the first user steer that ARRIVES after the wait has run
-	 * for {@link STEER_FOLD_GRACE_MS} since `startedAt`. A steer already queued
-	 * when the wait starts, or one that arrives inside the grace window, never
-	 * folds: the command finishes normally and that steer is consumed at the
-	 * ordinary tool boundary. The watcher keeps observing so a later qualifying
-	 * steer still folds, and re-checks the gate at that moment so a
-	 * `busyPromptMode` change during the command is honored.
-	 * Returns a stop function; call it when the wait settles. No-op when steer
-	 * folding is gated off at start.
-	 */
-	#watchSteerForFold(adapter: FoldAdapter, startedAt: number): () => void {
-		if (!this.#steerFoldEnabled()) return () => {};
-		const waitForSteer = this.session.waitForUserSteering;
-		const requestFold = this.session.requestForegroundBashBackground;
-		if (!waitForSteer || !requestFold) return () => {};
-		const watch = new AbortController();
-		const observe = async (): Promise<void> => {
-			while (!watch.signal.aborted) {
-				await waitForSteer(watch.signal);
-				if (watch.signal.aborted) return;
-				if (Date.now() - startedAt < STEER_FOLD_GRACE_MS) continue;
-				if (!this.#steerFoldEnabled()) continue;
-				await requestFold("steer", adapter);
-				return;
-			}
-		};
-		observe().catch((error: unknown) => {
-			logger.warn("Steer-triggered fold failed", {
-				jobId: adapter.jobId,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
-		return () => watch.abort();
 	}
 
 	/**
@@ -1269,7 +1269,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		const stopSteerWatch =
-			backgroundRequest && foldAdapter ? this.#watchSteerForFold(foldAdapter, startedAt) : () => {};
+			backgroundRequest && foldAdapter
+				? watchSteerForFold(this.session, startedAt, fold => fold("steer", foldAdapter), foldAdapter.jobId)
+				: () => {};
 		try {
 			return await Promise.race(waiters);
 		} finally {
@@ -1299,6 +1301,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		command: string;
 		commandCwd: string;
 		resolvedEnv: Record<string, string>;
+		unsetEnv: string[];
 		directMasterSpawn: boolean;
 		requestedTimeoutSec: number;
 		timeoutSec: number;
@@ -1471,6 +1474,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
+		const unsetEnv = COORDINATOR_ONLY_BASH_ENV.filter(name => !Object.hasOwn(expandedEnv ?? {}, name));
 
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
 			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
@@ -1503,6 +1507,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			command,
 			commandCwd,
 			resolvedEnv,
+			unsetEnv,
 			directMasterSpawn,
 			requestedTimeoutSec,
 			timeoutSec,
@@ -1571,9 +1576,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		notices: readonly string[],
 		signal: AbortSignal | undefined,
 		resolvedEnv: Record<string, string>,
+		activity: BashActivityDeclaration | undefined,
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const result = await this.#runDirectMasterSpawn(command, commandCwd, timeoutMs, signal, resolvedEnv);
-		return this.#buildCompletedResult(result, timeoutSec, { requestedTimeoutSec, notices });
+		return this.#buildCompletedResult(result, timeoutSec, { requestedTimeoutSec, notices, activity });
 	}
 
 	/**
@@ -1665,6 +1671,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						timeout: monitorTimeoutMs,
 						signal,
 						env: prepared.resolvedEnv,
+						unsetEnv: prepared.unsetEnv,
 						artifactPath,
 						artifactId,
 						artifactPublisher,
@@ -1723,6 +1730,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 			async: asyncRequested = false,
 			pty = false,
+			activity,
 		}: BashToolInput,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
@@ -1750,6 +1758,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			command,
 			commandCwd,
 			resolvedEnv,
+			unsetEnv,
 			directMasterSpawn,
 			requestedTimeoutSec,
 			timeoutSec,
@@ -1767,6 +1776,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				pendingNotices,
 				signal,
 				resolvedEnv,
+				activity,
 			);
 		}
 
@@ -1788,10 +1798,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				unsetEnv,
 				directMasterSpawn,
 				onUpdate,
 				startBackgrounded: true,
 				toolCallId,
+				activity,
 			});
 			const jobGeneration = asyncManager.getJob(job.jobId)?.generation ?? job.jobId;
 			job.setBackgrounded(true);
@@ -1799,6 +1811,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
+				activity,
 			});
 		}
 
@@ -1838,6 +1851,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				unsetEnv,
 				directMasterSpawn,
 				onUpdate,
 				startBackgrounded,
@@ -1845,6 +1859,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					managedForegroundSettled = true;
 				},
 				toolCallId,
+				activity,
 			});
 			const jobGeneration = ownedManager.getJob(job.jobId)?.generation ?? job.jobId;
 			if (startBackgrounded) {
@@ -1853,6 +1868,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
+					activity,
 				});
 			}
 			const backgroundRequest = Promise.withResolvers<FoldReason>();
@@ -1948,6 +1964,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				requestedTimeoutSec,
 				notices: pendingNotices,
 				foldReason: waitResult.reason,
+				activity,
 			});
 		}
 
@@ -2246,6 +2263,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								requestedTimeoutSec,
 								notices: timeoutNotices,
 								terminalId: handle.terminalId,
+								activity,
 							});
 						}
 
@@ -2378,6 +2396,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					requestedTimeoutSec,
 					notices: bridgeNotices,
 					terminalId: handle.terminalId,
+					activity,
 				});
 			};
 
@@ -2419,7 +2438,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							bridgeCompletion.resolve({ kind: "completed", result });
 							await reportProgress(
 								finalText,
-								bridgeBackgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined,
+								bridgeBackgrounded
+									? {
+											async: { state: "completed", jobId, type: "bash" },
+											...(activity === undefined ? {} : { activity }),
+										}
+									: undefined,
 							);
 							return finalText;
 						} catch (error) {
@@ -2429,7 +2453,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							bridgeCompletion.resolve({ kind: "failed", error });
 							await reportProgress(
 								message,
-								bridgeBackgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined,
+								bridgeBackgrounded
+									? {
+											async: { state: "failed", jobId, type: "bash" },
+											...(activity === undefined ? {} : { activity }),
+										}
+									: undefined,
 							);
 							throw error;
 						} finally {
@@ -2556,6 +2585,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 				terminalId: handle.terminalId,
 				foldReason: bridgeWait.reason,
+				activity,
 			});
 		}
 
@@ -2594,6 +2624,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					timeoutMs,
 					signal,
 					env: resolvedEnv,
+					unsetEnv,
 					artifactPath,
 					artifactId,
 					artifactPublisher,
@@ -2640,6 +2671,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 										outcome = await controls.terminalCompletion;
 										const completed = this.#buildCompletedResult(outcome, timeoutSec, {
 											requestedTimeoutSec,
+											activity,
 										});
 										return this.#extractTextResult(completed);
 									} finally {
@@ -2707,6 +2739,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									requestedTimeoutSec,
 									notices: pendingNotices,
 									foldReason: receipt.reason,
+									activity,
 								});
 								const outcome = controls.detachObserver(
 									interactiveResultFromText(this.#extractTextResult(started)),
@@ -2722,7 +2755,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							resolveForegroundObserver: () => "already-settled",
 						};
 						const unregisterPtyFold = this.session.registerForegroundFoldParticipant?.(ptyFoldAdapter);
-						const stopPtySteerWatch = this.#watchSteerForFold(ptyFoldAdapter, ptyStartedAt);
+						const stopPtySteerWatch = watchSteerForFold(
+							this.session,
+							ptyStartedAt,
+							fold => fold("steer", ptyFoldAdapter),
+							ptyFoldAdapter.jobId,
+						);
 						ptyFoldUnregister = () => {
 							stopPtySteerWatch();
 							unregisterPtyFold?.();
@@ -2755,6 +2793,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					timeout: timeoutMs,
 					signal,
 					env: resolvedEnv,
+					unsetEnv,
 					artifactPath,
 					artifactId,
 					artifactPublisher,
@@ -2790,6 +2829,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return this.#buildCompletedResult(result, timeoutSec, {
 			requestedTimeoutSec,
 			notices: pendingNotices,
+			activity,
 		});
 	}
 }

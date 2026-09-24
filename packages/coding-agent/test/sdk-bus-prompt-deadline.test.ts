@@ -4,9 +4,15 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { markNonDispatchedToolEvent, type RunSettlementProof } from "@gajae-code/agent-core";
-import type { Settings } from "../src/config/settings";
+import { logger } from "@gajae-code/utils";
+import {
+	DEFAULT_SDK_PROMPT_DEADLINE_MS,
+	DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
+	type Settings,
+} from "../src/config/settings";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
+import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
 
 /**
  * The notification/SDK bus host route and the SDK-only host route are mutually
@@ -58,6 +64,33 @@ function deadlineSettings(cwd: string, leaseMs: number, maxRuntimeMs: number): S
 	} as unknown as Settings;
 }
 
+/** Settings whose deadline reads all miss, so the bus must use the schema defaults. */
+function settingsWithoutDeadlineValues(cwd: string): Settings {
+	return { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+}
+
+async function git(root: string, args: string[]): Promise<string> {
+	const proc = Bun.spawn(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+	const [code, stdout, stderr] = await Promise.all([
+		proc.exited,
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+	]);
+	if (code !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+	return stdout;
+}
+
+/** A real repo with one commit plus an uncommitted edit the deadline must autosave. */
+async function initDirtyGitRepo(root: string): Promise<void> {
+	await git(root, ["init", "--initial-branch=bus"]);
+	await git(root, ["config", "user.email", "test@example.com"]);
+	await git(root, ["config", "user.name", "Test"]);
+	await fsPromises.writeFile(path.join(root, "README.md"), "hello\n");
+	await git(root, ["add", "README.md"]);
+	await git(root, ["commit", "-m", "init"]);
+	await fsPromises.writeFile(path.join(root, "agent-work.ts"), "export const done = true;\n");
+}
+
 function context(
 	cwd: string,
 	sessionId: string,
@@ -96,10 +129,21 @@ interface AcceptFailure {
 	armed: boolean;
 }
 
+/**
+ * The run resource ledger's `kind: "tool"` entries for the bound handle, as a
+ * test double. AgentLoop takes that lease SYNCHRONOUSLY before it invokes a
+ * tool's `execute` and releases it at the call's real end, so adding/removing an
+ * id here models the true execution boundary — independently of whether the
+ * corresponding `tool_execution_start` has finished crossing the asynchronous
+ * extension fanout yet (#5637).
+ */
+type LedgerTools = Set<string>;
+
 function start(
 	ctx: Record<string, unknown>,
 	settings: Settings,
 	acceptFailure: AcceptFailure = { armed: false },
+	ledgerTools?: LedgerTools,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -142,6 +186,14 @@ function start(
 						abortPromptAndWait: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 					}
 				).abortPromptAndWait(handle, seamOptions),
+			// Omitted entirely when the case does not opt in, which is also the
+			// older-host fallback: the deadline then uses the event-derived set alone.
+			...(ledgerTools
+				? {
+						pendingToolExecutions: (handle: string) =>
+							handle === "bus-deadline-run-handle" ? [...ledgerTools] : [],
+					}
+				: {}),
 		},
 	});
 	void handlers.get("session_start")?.({ type: "session_start" }, ctx);
@@ -163,6 +215,8 @@ interface BusSession {
 	acceptFailure: AcceptFailure;
 	/** Deadline callbacks the bus scheduled, captured around acceptance only. */
 	scheduled: (() => void)[];
+	/** Delays, in ms, of the callbacks captured in `scheduled`. */
+	scheduledDelays: number[];
 }
 
 /** Send one `turn.prompt` on an established session and return its acknowledgement. */
@@ -194,15 +248,29 @@ async function acceptPrompt(
 		extraPrompts?: string[];
 		captureSchedule?: boolean;
 		abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
+		ledgerTools?: LedgerTools;
+		/** Seed the session cwd before the bus starts (e.g. a real git repo). */
+		prepareCwd?: (cwd: string) => Promise<void>;
+		/** Replace the settings double, e.g. to opt out of the autosave. */
+		settings?: (cwd: string) => Settings;
+		/** Widen the deadline-schedule capture beyond the default lease window. */
+		scheduleFilter?: (delayMs: number) => boolean;
 	} = {},
 ): Promise<BusSession> {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-bus-deadline-${label}-`));
 	dirs.push(cwd);
+	await options.prepareCwd?.(cwd);
 	const sessionId = `sdk-bus-deadline-${label}-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId, options.abortPromptAndWait);
 	const acceptFailure: AcceptFailure = { armed: false };
-	const handlers = start(sessionContext, deadlineSettings(cwd, leaseMs, maxRuntimeMs), acceptFailure);
+	const handlers = start(
+		sessionContext,
+		options.settings?.(cwd) ?? deadlineSettings(cwd, leaseMs, maxRuntimeMs),
+		acceptFailure,
+		options.ledgerTools,
+	);
 	const scheduled: (() => void)[] = [];
+	const scheduledDelays: number[] = [];
 
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -228,7 +296,11 @@ async function acceptPrompt(
 				// remaining delay is the lease minus however long that write took.
 				// Match the whole upper half of the lease window: with the long lease
 				// these cases use, nothing else schedules anywhere near it.
-				if (delayMs !== undefined && delayMs > leaseMs / 2 && delayMs <= leaseMs) scheduled.push(callback);
+				const matches = options.scheduleFilter ?? ((delay: number) => delay > leaseMs / 2 && delay <= leaseMs);
+				if (delayMs !== undefined && matches(delayMs)) {
+					scheduled.push(callback);
+					scheduledDelays.push(delayMs);
+				}
 				return realSetTimeout(callback, delayMs, ...rest);
 			}) as never)
 		: undefined;
@@ -295,6 +367,7 @@ async function acceptPrompt(
 		cwd,
 		acceptFailure,
 		scheduled,
+		scheduledDelays,
 		extraCorrelations,
 		extraAcks,
 		handlers,
@@ -438,8 +511,18 @@ test("sustained attributable progress still terminalizes at the maximum runtime"
 	const maxRuntimeMs = 1_800;
 	const session = await acceptPrompt("cap", 700, maxRuntimeMs);
 	const progress = setInterval(() => {
+		// Each call is started AND completed: an unmatched start means the tool is
+		// still executing, which the deadline now waits a bounded grace for (#5637).
+		// Both events are equally attributable, so the renewal under test is
+		// unchanged — this only stops the fixture from claiming a growing pile of
+		// tools is permanently mid-execution.
+		const toolCallId = `cap-tool-${Date.now()}`;
 		session.handlers.get("tool_execution_start")?.(
-			{ type: "tool_execution_start", toolCallId: `cap-tool-${Date.now()}`, toolName: "read", args: {} },
+			{ type: "tool_execution_start", toolCallId, toolName: "read", args: {} },
+			session.sessionContext,
+		);
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId, toolName: "read", isError: false },
 			session.sessionContext,
 		);
 	}, 250);
@@ -885,6 +968,516 @@ test("a deadline that aborts a genuinely dispatched tool still publishes its ter
 		expect(record?.pendingOutcome).toBeUndefined();
 		expect(record?.pendingReceiptState).toBeUndefined();
 		expect((record?.error as { code?: string } | undefined)?.code).toBe("prompt_deadline_exceeded");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("the deadline abort lands after the running tool call reaches its boundary", async () => {
+	// #5637 AC-1: terminal fencing aborts the run BEFORE it waits for settlement,
+	// so a tool aborted mid-write leaves a torn artifact behind. Expiry must now
+	// wait for the dispatched call's own `tool_execution_end` first.
+	//
+	// Driven as a MAXIMUM-RUNTIME expiry: the boundary event is attributable
+	// progress, so under an inactivity lease it would renew the prompt and the
+	// abort would (correctly) never happen. The acceptance-anchored hard cap
+	// cannot be renewed past, so the abort still deterministically lands — just
+	// at the boundary instead of through the tool.
+	const maxRuntimeMs = 800;
+	const order: string[] = [];
+	const session = await acceptPrompt("boundary-order", 60_000, maxRuntimeMs, {
+		abortPromptAndWait: async () => {
+			order.push("abort");
+			return { status: "settled", terminalScope: {} };
+		},
+	});
+	try {
+		// A dispatched call that will SUCCEED slowly: a failing tool routes through
+		// the error path and would make the ordering assertion vacuous.
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "boundary-tool", toolName: "read", args: {} },
+			session.sessionContext,
+		);
+
+		// Proving a NEGATIVE inside a window, which a poll cannot express: well past
+		// the hard cap the abort must NOT have fired, because the tool is still
+		// running. Without the boundary wait it would have fired at ~800 ms.
+		await Bun.sleep(2_500);
+		expect(order).toEqual([]);
+		expect(session.deadlineTerminals()).toHaveLength(0);
+
+		// The tool reaches its boundary, comfortably inside the grace.
+		order.push("tool_execution_end");
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId: "boundary-tool", toolName: "read", isError: false },
+			session.sessionContext,
+		);
+
+		await waitFor(() => order.includes("abort"), "deadline abort after the tool boundary");
+		expect(order).toEqual(["tool_execution_end", "abort"]);
+		// Classification is untouched: still the same terminal deadline failure.
+		await waitFor(() => session.deadlineTerminals().length > 0, "boundary deadline terminal");
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("the bus deadline path autosaves the dirty worktree before ownership teardown", async () => {
+	// #5583 review round 2: the bus owns an independent deadline timer and
+	// terminalization path, so the host wiring in `session-runtime` never sees this
+	// expiry. Without the bus-side flush an active notification-bus session loses
+	// its dirty edits on a deadline — the exact work-loss this change prevents.
+	const session = await acceptPrompt("autosave", LEASE_MS, 60_000, {
+		prepareCwd: initDirtyGitRepo,
+		settings: cwd =>
+			({
+				get: (key: string) => {
+					if (key === "sdk.promptDeadlineMs") return LEASE_MS;
+					if (key === "sdk.promptMaxRuntimeMs") return 60_000;
+					if (key === "sdk.flushWorktreeOnDeadline") return true;
+					return undefined;
+				},
+				has: (key: string) => key === "sdk.flushWorktreeOnDeadline",
+				getAgentDir: () => cwd,
+			}) as unknown as Settings,
+	});
+	try {
+		await waitFor(() => session.deadlineTerminals().length > 0, "deadline terminal");
+
+		// The flush runs before the terminal is recorded and published, so the WIP
+		// commit already exists by the time that frame is observable.
+		expect(await git(session.cwd, ["log", "-1", "--pretty=%s"])).toBe("wip(bus): autosave on prompt deadline\n");
+		expect(await git(session.cwd, ["show", "HEAD:agent-work.ts"])).toBe("export const done = true;\n");
+		// Scoped to the agent's edit on purpose: the live session keeps writing its
+		// own state (agent.db, .gjc/) into the cwd, so the tree as a whole is never
+		// stably clean here.
+		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("");
+		// The terminal itself is untouched by the autosave.
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("a tool still executing when the boundary grace expires is force-terminated and recorded", async () => {
+	// #5637 AC-2: the wait is bounded. A tool that never reaches its boundary must
+	// still be force-terminated exactly as before — and the fact that the run was
+	// killed WHILE a tool was executing must survive in a structured form rather
+	// than being indistinguishable from a clean expiry.
+	const maxRuntimeMs = 800;
+	const diagnostics: Array<Record<string, unknown>> = [];
+	const forcedWarnings: Array<Record<string, unknown>> = [];
+	const errorSpy = spyOn(logger, "error").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_terminal_failed") diagnostics.push((fields ?? {}) as Record<string, unknown>);
+	}) as never);
+	const realWarn = logger.warn.bind(logger);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_deadline_forced_mid_tool") {
+			forcedWarnings.push((fields ?? {}) as Record<string, unknown>);
+			return;
+		}
+		return realWarn(event as never, fields as never);
+	}) as never);
+	const session = await acceptPrompt("boundary-forced", 60_000, maxRuntimeMs);
+	try {
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "stuck-tool", toolName: "bash", args: {} },
+			session.sessionContext,
+		);
+
+		await waitFor(() => session.deadlineTerminals().length > 0, "forced deadline terminal", 25_000);
+		// Bounded, not disabled — pinned in BOTH directions.
+		//
+		// The lower bound is a discriminating FRACTION of the grace, not a tight
+		// epsilon around it: `acceptedAt` is stamped after the acknowledgement frame
+		// round-trips, while the deadline is armed from the earlier SERVER-side
+		// durable accept, so this measures `real_elapsed - skew`. Under full-suite
+		// load that skew reaches hundreds of ms, and a tight epsilon then measures
+		// harness scheduling rather than the deadline. Without the boundary wait this
+		// terminal fires at ~maxRuntimeMs (800 ms), so half a grace still fails
+		// loudly on any regression that removes the wait.
+		const elapsed = Date.now() - session.acceptedAt;
+		expect(elapsed).toBeGreaterThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS / 2);
+		expect(elapsed).toBeLessThan(maxRuntimeMs + 2 * TOOL_CALL_BOUNDARY_GRACE_MS);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		// Classification is byte-identical to a clean expiry — downstream retry
+		// classifiers branch on these and must not move.
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+
+		// The structured record of the forced mid-tool kill: ids only.
+		expect(forcedWarnings).toHaveLength(1);
+		expect(forcedWarnings[0]?.pendingToolCallIds).toEqual(["stuck-tool"]);
+		expect(forcedWarnings[0]?.graceMs).toBe(TOOL_CALL_BOUNDARY_GRACE_MS);
+		expect(forcedWarnings[0]?.commandId).toBe(session.correlation.commandId);
+		expect(forcedWarnings[0]?.turnId).toBe(session.correlation.turnId);
+		// ... and the distinct terminal diagnostic reason.
+		const reason = String(diagnostics.at(-1)?.reason ?? "");
+		expect(reason).toContain("Prompt deadline exceeded.");
+		expect(reason).toContain("still executing");
+	} finally {
+		warnSpy.mockRestore();
+		errorSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 40_000);
+
+test("a tool that ends before expiry leaves the deadline path unchanged", async () => {
+	// Control: with nothing executing at expiry the boundary wait must not exist —
+	// no grace, no extra delay, and the original diagnostic reason verbatim. This
+	// passes both with and without the boundary wait, which is what makes the two
+	// cases above pin the behavioural delta rather than the new code's existence.
+	const maxRuntimeMs = 800;
+	const diagnostics: Array<Record<string, unknown>> = [];
+	const errorSpy = spyOn(logger, "error").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_terminal_failed") diagnostics.push((fields ?? {}) as Record<string, unknown>);
+	}) as never);
+	const session = await acceptPrompt("boundary-idle", 60_000, maxRuntimeMs);
+	try {
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "quick-tool", toolName: "read", args: {} },
+			session.sessionContext,
+		);
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId: "quick-tool", toolName: "read", isError: false },
+			session.sessionContext,
+		);
+
+		await waitFor(() => session.deadlineTerminals().length > 0, "idle-path deadline terminal");
+		expect(Date.now() - session.acceptedAt).toBeLessThan(maxRuntimeMs + 900);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect(String(diagnostics.at(-1)?.reason ?? "")).toBe("Prompt deadline exceeded.");
+	} finally {
+		errorSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 30_000);
+
+/**
+ * Capture `sdk_prompt_deadline_forced_mid_tool` without swallowing other warnings.
+ * Returns the collected records and a restore handle.
+ */
+function captureForcedWarnings(): { records: Array<Record<string, unknown>>; restore: () => void } {
+	const records: Array<Record<string, unknown>> = [];
+	const realWarn = logger.warn.bind(logger);
+	const spy = spyOn(logger, "warn").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_deadline_forced_mid_tool") {
+			records.push((fields ?? {}) as Record<string, unknown>);
+			return;
+		}
+		return realWarn(event as never, fields as never);
+	}) as never);
+	return { records, restore: () => spy.mockRestore() };
+}
+
+test("a tool the ledger reports running is not killed while its start event is stuck behind a slow extension", async () => {
+	// #5637 review thread P1: `runningToolCallIds` is populated from
+	// `tool_execution_start` travelling the ASYNCHRONOUS extension fanout, while
+	// the tool is ALREADY executing — AgentLoop publishes the event without
+	// awaiting it and invokes `execute` on the next line. A user extension
+	// registered ahead of the bus extension can therefore hold that event for as
+	// long as it likes, leaving the event-derived set EMPTY mid-`apply_patch`.
+	//
+	// Driven as a MAXIMUM-RUNTIME expiry so the boundary events, which are
+	// attributable progress, cannot renew the prompt out from under the case.
+	const maxRuntimeMs = 800;
+	const order: string[] = [];
+	// The REAL execution boundary: taken synchronously before `execute`, released
+	// at the call's real end.
+	const ledgerTools: LedgerTools = new Set();
+	const forced = captureForcedWarnings();
+	const session = await acceptPrompt("ledger-authority", 60_000, maxRuntimeMs, {
+		ledgerTools,
+		abortPromptAndWait: async () => {
+			order.push("abort");
+			return { status: "settled", terminalScope: {} };
+		},
+	});
+	// The slow PRECEDING extension: every tool event queues here instead of
+	// reaching the bus, and drains only when the extension lets go.
+	const stalledFanout: Array<() => void> = [];
+	const publishThroughSlowExtension = (type: string, event: Record<string, unknown>) => {
+		stalledFanout.push(() => void session.handlers.get(type)?.(event, session.sessionContext));
+	};
+	try {
+		// AgentLoop reserves the lease, then calls the file-mutating tool. The bus
+		// has observed NOTHING at this point — that is the whole bug.
+		ledgerTools.add("mutating-tool");
+		publishThroughSlowExtension("tool_execution_start", {
+			type: "tool_execution_start",
+			toolCallId: "mutating-tool",
+			toolName: "apply_patch",
+			args: {},
+		});
+
+		// Proving a NEGATIVE inside a window, which a poll cannot express: well past
+		// the hard cap the abort must NOT have fired, because a tool really is
+		// running. Before this fix the event-derived set was empty here, the idle
+		// branch was taken, and the abort landed mid-write at ~800 ms.
+		await Bun.sleep(2_500);
+		expect(order).toEqual([]);
+		expect(session.deadlineTerminals()).toHaveLength(0);
+
+		// The tool finishes for real: the ledger releases first, the held events
+		// drain afterwards, exactly as the real ordering would have it.
+		order.push("tool_execution_end");
+		ledgerTools.delete("mutating-tool");
+		publishThroughSlowExtension("tool_execution_end", {
+			type: "tool_execution_end",
+			toolCallId: "mutating-tool",
+			toolName: "apply_patch",
+			isError: false,
+		});
+		for (const deliver of stalledFanout.splice(0)) deliver();
+
+		await waitFor(() => order.includes("abort"), "deadline abort after the real tool boundary");
+		expect(order).toEqual(["tool_execution_end", "abort"]);
+		// It settled at the boundary; nothing was force-killed mid-tool.
+		expect(forced.records).toEqual([]);
+		await waitFor(() => session.deadlineTerminals().length > 0, "ledger-authority deadline terminal");
+		await Bun.sleep(200);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+	} finally {
+		forced.restore();
+		await shutdown(session);
+	}
+}, 40_000);
+
+test("sdk.flushWorktreeOnDeadline=false leaves the bus deadline worktree dirty", async () => {
+	const session = await acceptPrompt("autosave-off", LEASE_MS, 60_000, {
+		prepareCwd: initDirtyGitRepo,
+		settings: cwd =>
+			({
+				get: (key: string) => {
+					if (key === "sdk.promptDeadlineMs") return LEASE_MS;
+					if (key === "sdk.promptMaxRuntimeMs") return 60_000;
+					if (key === "sdk.flushWorktreeOnDeadline") return false;
+					return undefined;
+				},
+				getAgentDir: () => cwd,
+			}) as unknown as Settings,
+	});
+	try {
+		await waitFor(() => session.deadlineTerminals().length > 0, "deadline terminal");
+		await Bun.sleep(200);
+
+		// Opted out: no commit, and the edit is still sitting in the worktree.
+		expect((await git(session.cwd, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
+		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("?? agent-work.ts\n");
+		expect(session.deadlineTerminals()).toHaveLength(1);
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("a tool_execution_end delivered before its own start never forces a spurious mid-tool kill", async () => {
+	// #5637 review thread P1, mirror case. The fanout is unordered across
+	// listeners, so a finished call's end can reach the bus before its start. The
+	// late start used to add an id that could never be removed again: the deadline
+	// then burned the whole 5 s grace and reported a forced mid-tool kill for a
+	// tool that had already returned. The ledger — empty throughout here, because
+	// the call really is over — is the authority.
+	const maxRuntimeMs = 800;
+	const diagnostics: Array<Record<string, unknown>> = [];
+	const errorSpy = spyOn(logger, "error").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_terminal_failed") diagnostics.push((fields ?? {}) as Record<string, unknown>);
+	}) as never);
+	const ledgerTools: LedgerTools = new Set();
+	const forced = captureForcedWarnings();
+	const session = await acceptPrompt("end-before-start", 60_000, maxRuntimeMs, { ledgerTools });
+	try {
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId: "raced-tool", toolName: "read", isError: false },
+			session.sessionContext,
+		);
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "raced-tool", toolName: "read", args: {} },
+			session.sessionContext,
+		);
+
+		await waitFor(() => session.deadlineTerminals().length > 0, "unraced deadline terminal", 25_000);
+		// The discriminator: the cap WITHOUT the grace. A stale id would have held
+		// the terminal back by the full TOOL_CALL_BOUNDARY_GRACE_MS.
+		expect(Date.now() - session.acceptedAt).toBeLessThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS - 500);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect(forced.records).toEqual([]);
+		// Classification and diagnostic stay the clean-expiry ones.
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect(String(diagnostics.at(-1)?.reason ?? "")).toBe("Prompt deadline exceeded.");
+	} finally {
+		forced.restore();
+		errorSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 40_000);
+
+test("an empty ledger reading ends the wait even when a stale start event is still unmatched", async () => {
+	// #5637 review thread P2. The reverse direction of the ledger-authority case
+	// above, and the reason the pending set is a REPLACE rather than a union: the
+	// same asynchrony that delays a `tool_execution_start` also delays its END.
+	// The reachable ordering is start delivered -> real tool finishes and releases
+	// its lease -> end lost or stuck behind another extension. The ledger is then
+	// empty while `runningToolCallIds` still holds the id, and a union would burn
+	// the whole 5 s grace and record a forced mid-tool kill for a call that had
+	// already returned.
+	const maxRuntimeMs = 800;
+	const diagnostics: Array<Record<string, unknown>> = [];
+	const errorSpy = spyOn(logger, "error").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_terminal_failed") diagnostics.push((fields ?? {}) as Record<string, unknown>);
+	}) as never);
+	const ledgerTools: LedgerTools = new Set();
+	const forced = captureForcedWarnings();
+	const session = await acceptPrompt("ledger-released", 60_000, maxRuntimeMs, { ledgerTools });
+	try {
+		// AgentLoop takes the lease and publishes the start, which DOES reach the
+		// bus this time: the event-derived set now holds the id.
+		ledgerTools.add("released-tool");
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "released-tool", toolName: "apply_patch", args: {} },
+			session.sessionContext,
+		);
+
+		// The tool finishes for real and its lease is released. Its
+		// `tool_execution_end` never arrives — lost, or parked indefinitely behind
+		// another extension — so the id is stranded in `runningToolCallIds`.
+		ledgerTools.delete("released-tool");
+
+		await waitFor(() => session.deadlineTerminals().length > 0, "released-ledger deadline terminal", 25_000);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		// PRIMARY signal, and one that cannot flake: this is the ORDINARY deadline
+		// terminal, not the forced-mid-tool one. The forced path names the grace
+		// and the pending count in its diagnostic reason.
+		const reason = String(diagnostics.at(-1)?.reason ?? "");
+		expect(reason).toBe("Prompt deadline exceeded.");
+		expect(reason).not.toContain("Forced after");
+		expect(forced.records).toEqual([]);
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		// SECONDARY bound: the terminal lands at the cap, not at cap + grace. Split
+		// halfway so a loaded runner has ~2.5 s of slack on either side of the
+		// discriminator.
+		expect(Date.now() - session.acceptedAt).toBeLessThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS / 2);
+	} finally {
+		forced.restore();
+		errorSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 40_000);
+
+test("repeated tool_execution_updates at an already-due hard cap open exactly one boundary wait", async () => {
+	// #5637 review thread P2. `tool_execution_update` is attributable progress by
+	// design (a multi-minute compile must not trip the inactivity lease), and at an
+	// already-due HARD CAP `promptDeadlineAt` is pinned to `acceptedAt + maxMs`, so
+	// every update re-arms a ZERO-delay timer that walks straight past the re-arm
+	// check. Without a per-submission fence each one opened ANOTHER grace wait and
+	// they piled up concurrently through the whole 5 s grace.
+	const maxRuntimeMs = 600;
+	const ledgerTools: LedgerTools = new Set(["compiling-tool"]);
+	const forced = captureForcedWarnings();
+	const session = await acceptPrompt("one-wait", 60_000, maxRuntimeMs, { ledgerTools });
+	// One boundary wait arms exactly one timer at the grace, and the wait is
+	// otherwise unobservable from outside the bus. Scoped to the update storm so
+	// the spy cannot see session teardown's unrelated timers.
+	let boundaryWaits = 0;
+	const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: () => void,
+		delayMs?: number,
+		...rest: unknown[]
+	) => {
+		if (delayMs === TOOL_CALL_BOUNDARY_GRACE_MS) boundaryWaits += 1;
+		return realSetTimeout(callback, delayMs, ...rest);
+	}) as never);
+	const storm = setInterval(() => {
+		session.handlers.get("tool_execution_update")?.(
+			{ type: "tool_execution_update", toolCallId: "compiling-tool", output: "tick" },
+			session.sessionContext,
+		);
+	}, 50);
+	try {
+		await waitFor(() => session.deadlineTerminals().length > 0, "single-wait deadline terminal", 25_000);
+		clearInterval(storm);
+		// The storm ran for the cap plus the whole grace, i.e. ~100 updates; each
+		// one of them used to start its own wait.
+		expect(boundaryWaits).toBe(1);
+		expect(forced.records).toHaveLength(1);
+		expect(forced.records[0]?.pendingToolCallIds).toEqual(["compiling-tool"]);
+		// Bounded by the cap plus ONE grace, never a pile of overlapping ones. The
+		// lower bound is half a grace for the same reason as the forced case above:
+		// `acceptedAt` lags the server-side accept the deadline is armed from, so a
+		// tight epsilon measures harness skew instead of the deadline.
+		const elapsed = Date.now() - session.acceptedAt;
+		expect(elapsed).toBeGreaterThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS / 2);
+		expect(elapsed).toBeLessThan(maxRuntimeMs + 2 * TOOL_CALL_BOUNDARY_GRACE_MS);
+		await Bun.sleep(300);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+	} finally {
+		clearInterval(storm);
+		timerSpy.mockRestore();
+		forced.restore();
+		await shutdown(session);
+	}
+}, 60_000);
+
+test("a cancelled bus prompt never autosaves", async () => {
+	// Only the deadline path may commit: `turn.abort` is a real non-deadline
+	// terminal, and it must leave the worktree exactly as the user left it.
+	const leaseMs = 500;
+	const session = await acceptPrompt("autosave-cancel", leaseMs, 60_000, { prepareCwd: initDirtyGitRepo });
+	try {
+		const abortId = "autosave-cancel-abort";
+		session.socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: abortId,
+				operation: "turn.abort",
+				input: {},
+				idempotencyKey: "autosave-cancel-abort-key",
+			}),
+		);
+		await waitFor(
+			() => session.frames.some(frame => frame.type === "control_response" && frame.id === abortId),
+			"abort acknowledgement",
+		);
+		await waitFor(() => session.terminals(session.correlation).length > 0, "cancellation terminal");
+
+		// Past the original lease, so a late deadline autosave would have shown up.
+		await Bun.sleep(leaseMs * 3);
+		expect(session.deadlineTerminals()).toHaveLength(0);
+		expect((await git(session.cwd, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
+		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("?? agent-work.ts\n");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("the bus arms its deadline at the schema default when the setting read misses", async () => {
+	// #5584 fixed only the schema default and left the bus holding a hardcoded
+	// 1_800_000 fallback. `sdk-prompt-deadline-setting.test.ts` pins the schema
+	// default and the manager-armed lease; this pins the BUS-armed one, so a
+	// future divergent hardcode here fails the suite instead of shipping.
+	const session = await acceptPrompt(
+		"default-lease",
+		DEFAULT_SDK_PROMPT_DEADLINE_MS,
+		DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
+		{
+			settings: settingsWithoutDeadlineValues,
+			captureSchedule: true,
+			// Nothing else in the accept path schedules anywhere near an hour out.
+			scheduleFilter: delayMs => delayMs > 1_000_000,
+		},
+	);
+	try {
+		const armed = session.scheduledDelays[0] ?? 0;
+		// Armed from the lease minus however long the durable accept write took.
+		expect(armed).toBeLessThanOrEqual(DEFAULT_SDK_PROMPT_DEADLINE_MS);
+		expect(armed).toBeGreaterThan(DEFAULT_SDK_PROMPT_DEADLINE_MS - 60_000);
+		// The regression this exists to catch: the old 30-minute hardcode.
+		expect(armed).toBeGreaterThan(1_800_000);
 	} finally {
 		await shutdown(session);
 	}

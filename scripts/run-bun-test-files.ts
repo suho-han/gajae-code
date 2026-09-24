@@ -58,11 +58,23 @@ const INHERITED_GJC_STATE_ENV = [
 	"GJC_CODING_AGENT_DIR",
 	"PI_CODING_AGENT_DIR",
 	"PI_CONFIG_DIR",
-	"GJC_SESSION_ID",
-	"GJC_STATE_SESSION_ID",
-	"GJC_STATE_ROOT",
-	"GJC_LIFECYCLE_REQUEST_ID",
-	"GJC_SDK_LIFECYCLE_REQUEST",
+] as const;
+// Test children may intentionally set fixture controls themselves, but an
+// operator's shell must not select a broker/session/harness lane before the
+// child starts. Keep this prefix guard alongside the exact legacy aliases so
+// newly added state variables cannot silently reintroduce cross-shard leakage.
+const INHERITED_GJC_STATE_ENV_PREFIXES = [
+	"GJC_AUTH_BROKER_",
+	"GJC_COORDINATOR_",
+	"GJC_HARNESS_",
+	"GJC_LIFECYCLE_",
+	"GJC_SDK_",
+	"GJC_SESSION_",
+	"GJC_STATE_",
+	"GJC_TMUX_",
+	"PI_ARTIFACTS_",
+	"PI_SESSION_",
+	"PI_TOOL_BRIDGE_",
 ] as const;
 const CREDENTIAL_ENV_SUFFIXES = ["_API_KEY", "_AUTH_TOKEN", "_OAUTH_TOKEN", "_ACCESS_TOKEN"] as const;
 const CREDENTIAL_ENV_NAMES = new Set([
@@ -76,11 +88,13 @@ function isCredentialEnvironmentName(name: string): boolean {
 	return CREDENTIAL_ENV_NAMES.has(name) || CREDENTIAL_ENV_SUFFIXES.some(suffix => name.endsWith(suffix));
 }
 
-// This committed evidence oracle hashes its owning provider source. It is
-// scheduled directly when the evidence artifact changes; unrelated provider
-// edits intentionally make the committed blob stale until that owner regenerates
-// it, so package-wide runtime suites must not execute it implicitly.
-const SOURCE_BOUND_EVIDENCE_TESTS = new Set(["packages/ai/test/anthropic-cache-eval.integration.test.ts"]);
+// These suites are scheduled directly rather than run implicitly in package
+// shards. The AI evidence oracle hashes its owning provider source, while the
+// coding-agent owner-session integration test requires the Rust toolchain.
+const SHARD_EXCLUDED_TESTS = new Set([
+	"packages/ai/test/anthropic-cache-eval.integration.test.ts",
+	"packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
+]);
 
 function usage(message?: string): never {
 	if (message) process.stderr.write(`${message}\n`);
@@ -137,7 +151,7 @@ export async function enumerateTestFiles(root: string, base: string = repoRoot):
 		const normalized = entry.split(path.sep).join("/");
 		if (!TEST_FILE_PATTERN.test(normalized)) continue;
 		const file = path.posix.join(relativeRoot.split(path.sep).join("/"), normalized);
-		if (SOURCE_BOUND_EVIDENCE_TESTS.has(file)) continue;
+		if (SHARD_EXCLUDED_TESTS.has(file)) continue;
 		files.push(file);
 	}
 	return files.sort();
@@ -164,7 +178,13 @@ export function buildTestProcessSpec(
 			if (isCredentialEnvironmentName(name)) env[name] = undefined;
 		}
 	}
-	for (const name of INHERITED_GJC_STATE_ENV) env[name] = undefined;
+	for (const name of Object.keys(env)) {
+		if (
+			(INHERITED_GJC_STATE_ENV as readonly string[]).includes(name) ||
+			INHERITED_GJC_STATE_ENV_PREFIXES.some(prefix => name.startsWith(prefix))
+		)
+			env[name] = undefined;
+	}
 	return {
 		argv: ["bun", "test", `--timeout=${testTimeoutMs}`, "--preload", TEST_PRELOAD, `./${file}`],
 		cwd: base,

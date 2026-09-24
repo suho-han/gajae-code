@@ -24,6 +24,7 @@ import type {
 	WorkflowGateOption,
 	WorkflowGateQueryRecord,
 	WorkflowGateResolution,
+	WorkflowGateResolutionDiagnostic,
 	WorkflowGateResponse,
 	WorkflowGateValidationError,
 	WorkflowStage,
@@ -34,6 +35,9 @@ export type PersistedSemanticDisposition = "commit" | "resolve_without_commit";
 export type PersistedResolutionOrigin =
 	| { kind: "generic"; channel: "sdk" | "other" }
 	| { kind: "telegram_notification"; interactionActionId: string };
+
+/** Keep accepted diagnostics below the coordinator's cumulative Q12 snapshot cap. */
+export const MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS = 32;
 
 export type PersistedAckPolicy =
 	| { kind: "none"; reason: "non_telegram" | "semantic_noncommit" | "legacy_unproven" }
@@ -152,7 +156,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	readonly #emitterHooks: Pick<BrokerHooks, "advance">;
 	#runtimeTurnProvider: (() => string | undefined) | undefined;
 
-	constructor(runId: string, store: GateStore, emitterHooks: Pick<BrokerHooks, "advance"> = {}) {
+	constructor(runId: string, store: GateStore, emitterHooks: Pick<BrokerHooks, "advance" | "continuationLost"> = {}) {
 		this.#runId = runId;
 		this.#store = store;
 		this.#emitterHooks = emitterHooks;
@@ -164,6 +168,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 			completeAccepted: record => this.#completeAccepted(record),
 			finalizeAccepted: record => this.#finalizeAccepted(record),
 			terminalizeAccepted: record => this.#terminalizeAccepted(record),
+			continuationLost: record => emitterHooks.continuationLost?.(record),
 		});
 	}
 
@@ -1147,6 +1152,8 @@ export type GateAuditEvent =
 	| { event: "gate_response_accepted"; gate_id: string; answer_hash: string }
 	| { event: "gate_response_rejected"; gate_id: string; answer_hash: string }
 	| { event: "gate_response_idempotent_replay"; gate_id: string }
+	/** An idempotent replay refused because this runtime cannot prove the continuation ran. */
+	| { event: "gate_response_replay_unproven"; gate_id: string }
 	| { event: "gate_response_idempotency_conflict"; gate_id: string }
 	| { event: "gate_response_already_resolved"; gate_id: string }
 	| { event: "gate_response_unknown_gate"; gate_id: string }
@@ -1171,6 +1178,8 @@ export interface BrokerHooks {
 	terminalizeAccepted?(record: PersistedGate): WorkflowGateTerminalProof | Promise<WorkflowGateTerminalProof>;
 	/** Runs only after a successful advance has been durably marked advanced. */
 	completeAccepted?(record: PersistedGate): void | Promise<void>;
+	/** Notifies the owning runtime when the accepted answer cannot reach its continuation. */
+	continuationLost?(record: PersistedGate): void;
 	/** Append-only audit sink. */
 	audit?(event: GateAuditEvent): void;
 }
@@ -1222,6 +1231,14 @@ export class WorkflowGateBroker {
 	private readonly gateLocks = new Map<string, Promise<void>>();
 	private readonly continuations = new Map<string, GateContinuation>();
 	readonly #terminalProofs = new Map<string, WorkflowGateTerminalProof>();
+	/**
+	 * Gates whose `completeAccepted` hook threw after `advanced:true` was already
+	 * committed, so the durable record claims completion the continuation never
+	 * received. In-memory by design: the stranded turn belongs to this process's
+	 * waiter, so a restart cannot resolve it either way and must not inherit a
+	 * claim it cannot honor (#5599).
+	 */
+	readonly #continuationLost = new Set<string>();
 
 	private async withGateLock<T>(gateId: string, operation: () => Promise<T>): Promise<T> {
 		const previous = this.gateLocks.get(gateId) ?? Promise.resolve();
@@ -1282,6 +1299,34 @@ export class WorkflowGateBroker {
 				`idempotency_conflict: gate ${response.gate_id} resolved with a different body`,
 			);
 		if (response.idempotency_key !== undefined && sameKey && sameBody) {
+			// A record whose `completeAccepted` threw is durably indistinguishable from a
+			// genuinely completed one: `advanced:true` is committed before the waiter is
+			// resolved, so the shape below matches either way. Reporting `completed` there
+			// told `resolveSdkWorkflowGate`'s catch path to return a successful resolution
+			// for a turn whose continuation was never resolved — `ok:true status:"accepted"`
+			// with an empty pending-gate list and a prompt stuck `in_flight` forever, with
+			// no recovery path because `recover()` skips advanced records (#5599).
+			//
+			// Downgrading to `accepted_incomplete` routes it through the existing
+			// recover-then-recheck branch and, when that cannot resolve it, surfaces the
+			// documented `terminal_uncertain` instead of a false success.
+			//
+			// TWO conditions, because the loss cannot be persisted: an `accepted` record
+			// may not carry a `lifecycle` and a `quarantined` one must be `advanced:false`,
+			// so the durable shape has nowhere to record it.
+			//
+			// 1. This runtime saw the hook throw.
+			if (this.#continuationLost.has(response.gate_id)) return { kind: "accepted_incomplete" };
+			// 2. The record belongs to a PREVIOUS runtime. A continuation waiter is
+			//    process-local and cannot survive a restart, so this process can never
+			//    prove the prior turn was resolved — and the in-memory set above is empty
+			//    after a restart, which is exactly how the first fix still handed back a
+			//    false `completed` on a cross-restart idempotent retry (#5599 review).
+			//    Fail closed instead. The cost is telling a retry "uncertain" about a gate
+			//    that did complete under the dead runtime; that is the honest answer
+			//    regardless, because the turn it belonged to died with that process and no
+			//    retry can continue it.
+			if (record.ownerInstanceId !== this.instanceId) return { kind: "accepted_incomplete" };
 			if (record.terminalized === true && record.advanced === true && record.resolution)
 				return { kind: "completed", resolution: record.resolution };
 			return { kind: "accepted_incomplete" };
@@ -1309,6 +1354,17 @@ export class WorkflowGateBroker {
 
 	private hasLiveContinuation(gateId: string): boolean {
 		return this.continuations.get(gateId)?.isLive(gateId) === true;
+	}
+
+	private recordContinuationLoss(gateId: string): void {
+		this.#continuationLost.add(gateId);
+		const lost = this.store.get(gateId);
+		if (!lost) return;
+		try {
+			this.hooks.continuationLost?.(lost);
+		} catch {
+			// A settlement notification must never replace the original resolution error.
+		}
 	}
 
 	hasRecoverableAcceptedGate(): boolean {
@@ -1395,8 +1451,10 @@ export class WorkflowGateBroker {
 			.filter(
 				(
 					record,
-				): record is PersistedGate & { status: "quarantined"; lifecycle: WorkflowGateDiagnostic["lifecycle"] } =>
-					record.status === "quarantined" && record.lifecycle !== undefined,
+				): record is PersistedGate & {
+					status: "quarantined";
+					lifecycle: WorkflowGateDiagnostic["lifecycle"];
+				} => record.status === "quarantined" && record.lifecycle !== undefined,
 			)
 			.sort(
 				(left, right) =>
@@ -1408,6 +1466,7 @@ export class WorkflowGateBroker {
 				id: `diagnostic:${record.gate.gate_id}`,
 				tag: "quarantined",
 				lifecycle: record.lifecycle,
+				answer_recorded: Object.hasOwn(record, "answer"),
 			}));
 	}
 
@@ -1421,8 +1480,38 @@ export class WorkflowGateBroker {
 					this.hasLiveContinuation(record.gate.gate_id),
 			)
 			.sort(compareGates)
-			.map(record => ({ ...record.gate, id: `pending:${record.gate.gate_id}`, tag: "pending" }));
-		return [...pending, ...this.listGateDiagnostics()];
+			.map(record => ({
+				...record.gate,
+				id: `pending:${record.gate.gate_id}`,
+				tag: "pending" as const,
+				answer_recorded: false as const,
+			}));
+		const accepted: WorkflowGateResolutionDiagnostic[] = this.store
+			.list()
+			.filter((record): record is PersistedGate & { status: "accepted" } => record.status === "accepted")
+			.sort(
+				(left, right) =>
+					(right.resolution?.resolved_at ?? "").localeCompare(left.resolution?.resolved_at ?? "") ||
+					right.gate.gate_id.localeCompare(left.gate.gate_id),
+			)
+			.slice(0, MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS)
+			.map(record => ({
+				...record.gate,
+				id: `diagnostic:${record.gate.gate_id}`,
+				tag: "accepted" as const,
+				answer_recorded: true as const,
+				resolved_at: record.resolution?.resolved_at ?? record.gate.created_at,
+				post_accept_disposition: this.#continuationLost.has(record.gate.gate_id)
+					? "continuation_lost"
+					: record.advanced
+						? record.ownerInstanceId === this.instanceId
+							? "advanced"
+							: "unknown"
+						: record.terminalized === true
+							? "terminalized"
+							: "accepted",
+			}));
+		return [...pending, ...accepted, ...this.listGateDiagnostics()];
 	}
 
 	/** Open and emit a gate. The pending record is persisted BEFORE emission. */
@@ -1516,6 +1605,17 @@ export class WorkflowGateBroker {
 			const sameBody = record.responseHash === responseHash;
 			const sameKey = record.idempotencyKey === response.idempotency_key;
 			if (response.idempotency_key !== undefined && sameKey && sameBody) {
+				// Same provenance rule as `lookupCompletedResolution`: an idempotent replay must
+				// not hand back an accepted resolution for a continuation this runtime cannot
+				// prove was resolved. Without this, a direct `resolveGate()` retry bypassed the
+				// lookup entirely and reproduced the original false success (#5599 review).
+				if (this.#continuationLost.has(response.gate_id) || record.ownerInstanceId !== this.instanceId) {
+					this.hooks.audit?.({ event: "gate_response_replay_unproven", gate_id: response.gate_id });
+					throw new WorkflowGateBrokerError(
+						"unknown_gate",
+						`accepted gate ${response.gate_id} cannot be replayed: this runtime cannot prove its continuation was resolved`,
+					);
+				}
 				this.hooks.audit?.({ event: "gate_response_idempotent_replay", gate_id: response.gate_id });
 				return record.resolution as WorkflowGateResolution;
 			}
@@ -1609,7 +1709,16 @@ export class WorkflowGateBroker {
 				`accepted gate ${response.gate_id} lost its continuation before advance completed`,
 			);
 		this.store.put({ ...latest, advanced: true });
-		await this.hooks.completeAccepted?.(this.store.get(response.gate_id) as PersistedGate);
+		// `advanced:true` is already durable, so a throw here cannot be undone — but it
+		// must not be reported as a completed resolution either. Mark the loss before
+		// rethrowing so `lookupCompletedResolution` stops claiming completion for a
+		// continuation that was never resolved (#5599).
+		try {
+			await this.hooks.completeAccepted?.(this.store.get(response.gate_id) as PersistedGate);
+		} catch (error) {
+			this.recordContinuationLoss(response.gate_id);
+			throw error;
+		}
 		this.continuations.get(response.gate_id)?.release?.(response.gate_id);
 		this.continuations.delete(response.gate_id);
 		return resolution;
@@ -1659,7 +1768,15 @@ export class WorkflowGateBroker {
 					if (latest?.status !== "accepted" || latest.advanced || !this.hasLiveContinuation(listed.gate.gate_id))
 						return;
 					this.store.put({ ...latest, advanced: true });
-					await this.hooks.completeAccepted?.(this.store.get(latest.gate.gate_id) as PersistedGate);
+					// Same durable-commit-then-resolve ordering as `resolve()`; mark the
+					// loss so a recovery attempt cannot leave behind a record that claims
+					// completion its continuation never received (#5599).
+					try {
+						await this.hooks.completeAccepted?.(this.store.get(latest.gate.gate_id) as PersistedGate);
+					} catch (error) {
+						this.recordContinuationLoss(latest.gate.gate_id);
+						throw error;
+					}
 					this.continuations.get(latest.gate.gate_id)?.release?.(latest.gate.gate_id);
 					this.continuations.delete(latest.gate.gate_id);
 					this.hooks.audit?.({ event: "gate_advance_recovered", gate_id: latest.gate.gate_id });

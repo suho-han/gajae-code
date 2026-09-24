@@ -8,6 +8,7 @@ import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
+import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
 import { SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
@@ -37,7 +38,13 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
-import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
+import {
+	deriveIdempotencyIdentity,
+	deriveLegacyIdentity,
+	deriveLegacyTargetIdentity,
+	deriveScopedIdempotencyIdentity,
+	getBrokerIdentityKey,
+} from "./identity";
 import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
@@ -52,7 +59,38 @@ import {
 	LifecycleLedger,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
+	type TerminalReadBack,
 } from "./lifecycle-ledger";
+import {
+	cancelManagedTasks,
+	createManagedDomainBinding,
+	currentManagedRevision,
+	defineManagedTaskGraph,
+	inspectManagedAttemptByNativeIdentity,
+	loadManagedDomainBinding,
+	loadManagedEnrollmentRecord,
+	lookupManagedAttemptByNativeIdentity,
+	type ManagedAttemptRef,
+	type ManagedDomainBinding,
+	type ManagedEnrollmentRecord,
+	type ManagedTaskAttempt,
+	managedAttemptRefMatches,
+	managedIdentity,
+	managedNativeVector,
+	managedTaskDomainPath,
+	markManagedEnrollmentEstablished,
+	markManagedEnrollmentPending,
+	markManagedEnrollmentPublishing,
+	observeOrAdmitManagedTask,
+	recordManagedEnrollment,
+	recordManagedNativeObservation,
+	restoreManagedAttemptRefs,
+	reviseManagedTaskGraph,
+	transactManagedTaskDomain,
+	validateManagedTaskDomain,
+	withManagedNativeEffectAuthorized,
+} from "./managed-task-dag";
+import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { sdkInternalRuntimeImage } from "./runtime";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
@@ -209,7 +247,7 @@ export type BrokerCleanupEvidence = {
 	artifactsIdentity?: BrokerCleanupIdentity;
 	transcriptIdentity?: BrokerCleanupIdentity;
 	transcriptParentIdentity?: { dev: string; ino: string };
-	/** Identity-bound lifecycle metadata marker retained when exact cleanup is deferred. */
+	/** Identity-bound lifecycle metadataker retained when exact cleanup is deferred. */
 	metadataIdentity?: BrokerCleanupIdentity;
 	metadataPath?: string;
 	/** Monotonic append-only cleanup attempt. */
@@ -241,7 +279,7 @@ export type BrokerCleanupEvidence = {
 	/** Fully identity-bound startup-failure cleanup plan, persisted before any detach. */
 	lifecycleFiles?: BrokerLifecycleCleanupFile[];
 	lifecycleParentIdentity?: { dev: string; ino: string };
-	/** Delete metadata receipts authorize only the canonical marker/ready sibling pair. */
+	/** Delete metadata receipts authorize only the canonicalker/ready sibling pair. */
 	lifecycleDeleteMetadata?: true;
 };
 export type BrokerResponse =
@@ -259,6 +297,17 @@ export type BrokerResponse =
 			durableEffects?: LifecycleDurableEffectsReceipt;
 			startupFailure?: LifecycleStartupFailureReceipt;
 	  };
+type VerifiedManagedOwner =
+	| {
+			kind: "verified";
+			ownerSessionId: string;
+			attestationEpoch: string;
+			controlRoot: string;
+			enrollmentId: string;
+			worktrees: string[];
+			aliases?: string[];
+	  }
+	| { kind: "denied"; response: BrokerResponse };
 const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
 const spawnFailureError = (failure: SpawnSubstrateFailure): BrokerResponse => ({
 	ok: false,
@@ -334,7 +383,7 @@ function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 		: "terminal_error";
 }
 
-type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
+export type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
 type SessionListCursor = {
 	sessions: IndexedSession[];
@@ -356,6 +405,7 @@ type SpawnInFlight = {
 	resolve: (response: BrokerResponse) => void;
 	claimId?: string;
 	phase?: SpawnClaimV2["state"];
+	managedRequestHash?: string;
 };
 
 /** Complete five-leg child endpoint pin captured at registration. */
@@ -411,6 +461,9 @@ type SpawnAdmissionInput = {
 	cwd: string;
 	modelId?: string;
 	modelPreset?: string;
+	managedAttempt?: ManagedAttemptRef;
+	managedBinding?: ManagedDomainBinding;
+	managedNativeVector?: string;
 };
 
 function parseSpawnInput(
@@ -505,6 +558,23 @@ const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
+const MANAGED_CLOSE_WAIT_MS = 10_000;
+
+function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+	const settled = Promise.withResolvers<boolean>();
+	const timer = setTimeout(() => settled.resolve(false), timeoutMs);
+	void promise.then(
+		() => {
+			clearTimeout(timer);
+			settled.resolve(true);
+		},
+		() => {
+			clearTimeout(timer);
+			settled.resolve(true);
+		},
+	);
+	return settled.promise;
+}
 
 /** The five legs every usable pin must carry; a partial pin is missing authority. */
 type CompleteSpawnPinAuthority = SpawnAuthorityV1 & {
@@ -560,6 +630,26 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 		(candidate.hostIncarnation ?? candidate.processIncarnation) === pinned.processIncarnation &&
 		resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(pinned.cwd) &&
 		resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(pinned.stateRoot)
+	);
+}
+
+/** Exact admission predicate for the child host row published after launch. */
+export function spawnRegistrationMatches(
+	candidate: IndexedSession,
+	expected: { childId: string; cwd: string; stateRoot: string },
+): boolean {
+	return (
+		candidate.sessionId === expected.childId &&
+		candidate.endpointGeneration > 0 &&
+		candidate.live &&
+		!candidate.terminal &&
+		!candidate.terminalUncertain &&
+		// The child publishes a realpath-canonicalized locator while the launch
+		// spec carries the caller's lexical spelling. Compare path identity so a
+		// symlinked workspace (macOS /var vs /private/var) cannot strand a valid
+		// registration behind different spellings.
+		resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(expected.cwd) &&
+		resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(expected.stateRoot)
 	);
 }
 
@@ -635,7 +725,7 @@ function normalizeAliasedString(
 	return { value: values[0] };
 }
 
-function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
+export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
@@ -725,9 +815,45 @@ function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	const record = value as Record<string, unknown>;
 	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
 		.sort()
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
+}
+
+type TerminalPersistenceVerification =
+	| { kind: "unverified" }
+	| { kind: "verified" }
+	| { kind: "uncertain"; mismatches: readonly string[] };
+
+function verifyTerminalPersistence(
+	readBack: TerminalReadBack,
+	storedResponse: BrokerResponse,
+	durableEffects: LifecycleDurableEffectsReceipt | undefined,
+	startupFailure: LifecycleStartupFailureReceipt | undefined,
+): TerminalPersistenceVerification {
+	// An absent read-back is a verification failure, not evidence that the
+	// operation itself is ambiguous. The terminal transition was already synced
+	// before this read, so preserve its settled outcome and let a later reader
+	// reconcile the durable row.
+	if (readBack.kind === "absent") return { kind: "unverified" };
+	// A *rejected* row is the opposite: the ledger holds something for this request
+	// and refused it. That is damaged durable state, which previously fenced the
+	// session and must keep fencing it — treating it as "not yet written" would let
+	// a corrupt row clear the fence it exists to raise.
+	if (readBack.kind === "rejected") return { kind: "uncertain", mismatches: [`readBack:${readBack.reason}`] };
+	const persisted = readBack.entry;
+	const optionalReceiptJson = (value: unknown): string | undefined =>
+		value === undefined || value === null ? undefined : canonicalJson(value);
+	// The field name is always present; only the two compared receipt renderings are
+	// optional. Naming that shape keeps the mismatch list a plain string list.
+	const comparisons: readonly (readonly [string, string | undefined, string | undefined])[] = [
+		["response", canonicalJson(persisted.response), canonicalJson(storedResponse)],
+		["durableEffects", optionalReceiptJson(persisted.durableEffects), optionalReceiptJson(durableEffects)],
+		["startupFailure", optionalReceiptJson(persisted.startupFailure), optionalReceiptJson(startupFailure)],
+	];
+	const mismatches = comparisons.filter(([, actual, expected]) => actual !== expected).map(([field]) => field);
+	return mismatches.length === 0 ? { kind: "verified" } : { kind: "uncertain", mismatches };
 }
 
 function credentialFreeLifecycleResponse(value: unknown): unknown {
@@ -903,13 +1029,29 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
 			};
 		case "session.resume":
-		case "session.close":
 		case "session.delete":
 		case "session.reconcile_uncertain":
 			return { sessionId: id };
+		case "session.close":
+			return { sessionId: id, ...closeTargetAuthority(input) };
 		default:
 			return { operation, root, sessionId: id };
 	}
+}
+
+function closeTargetAuthority(input: Record<string, unknown>): {
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+} {
+	if (
+		typeof input.endpointGeneration !== "number" ||
+		!Number.isSafeInteger(input.endpointGeneration) ||
+		input.endpointGeneration <= 0 ||
+		typeof input.endpointIncarnation !== "string" ||
+		!/^[a-f0-9]{64}$/u.test(input.endpointIncarnation)
+	)
+		return {};
+	return { endpointGeneration: input.endpointGeneration, endpointIncarnation: input.endpointIncarnation };
 }
 
 /**
@@ -990,10 +1132,11 @@ function isBrokerLockArtifactName(name: string): boolean {
  * Decide whether one candidate directory is provably abandoned.
  *
  * Fail-closed by construction: every branch that cannot prove abandonment
- * returns a retention reason. A tombstone is only abandoned when its owner
- * record parses and names a dead PID — an unreadable, permission-denied, or
- * absent record keeps it forever. Backup directories carry no owner contract,
- * so an absent record there is not ambiguity and age alone governs.
+ * returns a retention reason. A tombstone with an owner record is only
+ * abandoned when that record names a dead PID. A missing record is abandoned
+ * only when the aged tombstone is empty; non-empty tombstones remain retained
+ * as ambiguous evidence. Backup directories carry no owner contract, so an
+ * absent record there is not ambiguity and age alone governs.
  */
 async function classifyBrokerLockArtifact(
 	directory: string,
@@ -1014,7 +1157,14 @@ async function classifyBrokerLockArtifact(
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code !== "ENOENT" && code !== "ENOTDIR") return "owner-record-unreadable";
-		return name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX) ? "owner-record-missing" : "abandoned";
+		if (!name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX)) return "abandoned";
+		try {
+			const entries = await fs.readdir(target);
+			return entries.length === 0 ? "abandoned" : "owner-record-missing";
+		} catch (readError) {
+			if ((readError as NodeJS.ErrnoException).code === "ENOENT") throw readError;
+			return "owner-record-unreadable";
+		}
 	}
 	let pid: unknown;
 	try {
@@ -1034,7 +1184,8 @@ async function classifyBrokerLockArtifact(
  * of the lock's dev+ino, so a machine accrues one directory per dead owner and
  * nothing ever removed them (54 on the install in #3963). Reaping is
  * best-effort and fail-closed: anything live, unreadable, permission-denied, or
- * otherwise ambiguous is kept and the reason is logged.
+ * otherwise ambiguous is kept. Retained paths are logged at debug level and
+ * summarized in one warning per reap pass.
  */
 export async function reapStaleBrokerLockArtifacts(input: {
 	agentDir: string;
@@ -1048,6 +1199,7 @@ export async function reapStaleBrokerLockArtifacts(input: {
 	const pidAlive = input.pidAlive ?? isPidAlive;
 	const removed: string[] = [];
 	const retained: BrokerLockArtifactRetention[] = [];
+	const retainedByReason = new Map<BrokerLockArtifactRetentionReason, number>();
 	let names: string[];
 	try {
 		names = await fs.readdir(directory);
@@ -1069,7 +1221,10 @@ export async function reapStaleBrokerLockArtifacts(input: {
 		}
 		if (verdict !== "abandoned") {
 			retained.push({ path: target, reason: verdict });
-			if (verdict !== "within-grace") logger.warn(`sdk broker: retained stale lock artifact ${name} (${verdict})`);
+			if (verdict !== "within-grace") {
+				logger.debug(`sdk broker: retained stale lock artifact ${name} (${verdict})`);
+				retainedByReason.set(verdict, (retainedByReason.get(verdict) ?? 0) + 1);
+			}
 			continue;
 		}
 		try {
@@ -1078,8 +1233,17 @@ export async function reapStaleBrokerLockArtifacts(input: {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 			retained.push({ path: target, reason: "removal-failed" });
-			logger.warn(`sdk broker: retained stale lock artifact ${name} (removal-failed)`);
+			logger.debug(`sdk broker: retained stale lock artifact ${name} (removal-failed)`);
+			retainedByReason.set("removal-failed", (retainedByReason.get("removal-failed") ?? 0) + 1);
 		}
+	}
+	if (retainedByReason.size > 0) {
+		const details = [...retainedByReason.entries()]
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([reason, count]) => `${reason}: ${count}`)
+			.join(", ");
+		const retainedCount = [...retainedByReason.values()].reduce((total, count) => total + count, 0);
+		logger.warn(`sdk broker: retained ${retainedCount} stale lock artifact(s) (${details})`);
 	}
 	if (removed.length > 0) logger.info(`sdk broker: reaped ${removed.length} stale lock artifact(s)`);
 	return { removed, retained };
@@ -1283,6 +1447,7 @@ const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublica
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
 const livenessGraceOverridesForTest = new WeakMap<Broker, number>();
 const heartbeatStallOverridesForTest = new WeakMap<Broker, PromiseWithResolvers<void>>();
+const managedCloseWaitOverridesForTest = new WeakMap<Broker, number>();
 
 export class Broker {
 	readonly settings: ResolvedBrokerSettings;
@@ -1295,6 +1460,9 @@ export class Broker {
 	#chains = new Map<string, Promise<void>>();
 	#spawnInFlight = new Map<string, SpawnInFlight>();
 	#spawnTasks = new WeakMap<SpawnInFlight, string>();
+	#managedAttempts = new Map<string, ManagedAttemptRef>();
+	#managedFailedRoots = new Set<string>();
+	#managedEnrollmentFailed = false;
 	#spawnAuthority: SpawnAuthorityStore | null = null;
 	#spawnPromptLayer: SpawnPromptLayer;
 	#spawnReapInFlight = false;
@@ -1369,11 +1537,17 @@ export class Broker {
 	async #handleSpawn(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
 		const admission = parseSpawnInput(input, idempotencyKey);
 		if (isBrokerResponse(admission)) return admission;
-		const lifecycleIdentity = await deriveIdempotencyIdentity(
+		// session.spawn predates target-bound lifecycle identities and its durable
+		// authority store already binds the raw request. Keep the v3 identity for
+		// new claims, while recognizing the v4 identity written by the short-lived
+		// target-bound implementation so an upgrade cannot admit a second child.
+		const targetBoundIdentity = await deriveIdempotencyIdentity(
 			this.settings.agentDir,
 			"session.spawn",
 			idempotencyKey!,
 		);
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey!);
+		const lifecycleIdentity = this.#spawnAuthority?.claim(targetBoundIdentity) ? targetBoundIdentity : legacyIdentity;
 		const active = this.#spawnInFlight.get(lifecycleIdentity);
 		if (active) {
 			if (this.#spawnTasks.get(active) !== admission.task)
@@ -1404,119 +1578,12 @@ export class Broker {
 				admission.masterCapability = "";
 			}
 			if (!verified.allowed) return finish(error("spawn_failed", "master capability verification was denied"));
-			const key = await getBrokerIdentityKey(this.settings.agentDir);
-			const authority = this.#spawnAuthority;
-			if (!authority) return finish(error("unavailable", "spawn authority is unavailable"));
-			const requestBindingMac = spawnBindingMac(
-				key,
-				admission,
-				admission.modelId ?? null,
-				admission.modelPreset ?? null,
-			);
-			const existing = authority.claim(lifecycleIdentity);
-			const resolveModels = async (): Promise<BrokerResponse | undefined> => {
-				// Validate the optional profile BEFORE any new durable claim or substrate
-				// effect. Generic lifecycle create validates it; spawn must do the same.
-				if (admission.modelPreset !== undefined) {
-					const validated = validateBrokerModelPresetSync(this.settings.agentDir, admission.modelPreset);
-					if (isBrokerResponse(validated)) return validated;
-					admission.modelPreset = validated;
-				}
-				// Resolve the explicit model pin before a new durable claim. Raw
-				// selectors must never reach a newly launched child.
-				if (admission.modelId !== undefined) {
-					const resolved = await this.#resolveModelPin(admission.modelId, { cwd: admission.cwd });
-					if (!resolved.ok) return error("unknown_model", resolved.error);
-					if (resolved.model === null)
-						return error("unknown_model", "session.spawn modelId could not be resolved.");
-					admission.modelId = resolved.model;
-				}
-				return undefined;
-			};
-			let decision: SpawnClaimDecision;
-			if (existing !== undefined) {
-				// An existing claim carries the raw-selector binding, so terminal and
-				// replay responses do not depend on today's model/profile catalog.
-				let existingBindingMac: string | undefined;
-				if (existing.requestBindingMac === undefined) {
-					// Claims written before raw-selector evidence was introduced only have
-					// the canonical binding. Re-resolve that historical selector before
-					// comparison; if the catalog no longer proves it, fail closed rather
-					// than guessing or weakening idempotency conflict protection.
-					const modelError = await resolveModels();
-					if (modelError) return finish(modelError);
-					existingBindingMac = spawnBindingMac(
-						key,
-						admission,
-						admission.modelId ?? null,
-						admission.modelPreset ?? null,
-					);
-				}
-				decision = await authority.claimOrJoin(
-					lifecycleIdentity,
-					existingBindingMac,
-					existingBindingMac ?? requestBindingMac,
-				);
-				if (decision.kind === "owner") {
-					becameOwner = true;
-					// A recovered pre-send claim may still need to launch. Preserve the
-					// fail-closed model validation for that effectful path and reject a
-					// catalog remap rather than launching a different model.
-					const modelError = await resolveModels();
-					if (modelError) return finish(modelError);
-					const recoveredBindingMac = spawnBindingMac(
-						key,
-						admission,
-						admission.modelId ?? null,
-						admission.modelPreset ?? null,
-					);
-					if (recoveredBindingMac !== decision.claim.bindingMac)
-						return finish(
-							error("idempotency_conflict", "session.spawn model selection differs from its durable claim"),
-						);
-				}
-			} else {
-				const modelError = await resolveModels();
-				if (modelError) {
-					// A concurrent claimant may have durably established this exact raw
-					// request while catalog loading was in flight. Re-check its opaque
-					// binding before returning the validation failure.
-					const raced = authority.claim(lifecycleIdentity);
-					if (raced === undefined) return finish(modelError);
-					decision = await authority.claimOrJoin(lifecycleIdentity, undefined, requestBindingMac);
-					if (decision.kind === "owner") {
-						becameOwner = true;
-						return finish(modelError);
-					}
-				} else {
-					const bindingMac = spawnBindingMac(
-						key,
-						admission,
-						admission.modelId ?? null,
-						admission.modelPreset ?? null,
-					);
-					decision = await authority.claimOrJoin(lifecycleIdentity, bindingMac, requestBindingMac);
-				}
-			}
-			if (decision.kind === "idempotency_conflict")
-				return finish(
-					error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim"),
-				);
-			if (decision.kind === "in_progress")
-				return finish(error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
-			if (decision.kind === "terminal_uncertain")
-				return finish(error("terminal_uncertain", "session.spawn outcome is uncertain"));
-			if (decision.kind === "terminal") return finish(this.#spawnTerminalResponse(decision.claim));
-			if (decision.kind === "replay")
-				return finish(await this.#reconcileSpawnReplay(lifecycleIdentity, decision.claim));
-			becameOwner = true;
-			inFlight.claimId = decision.claim.claimId;
-			inFlight.phase = decision.claim.state;
-			// Claim fsync precedes this audit mirror. Substrate work may start
-			// only after the mirror succeeds; a startup reconciler rebuilds it claim-first.
-			await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac);
+			const managedDenied = await this.#denyOrdinaryManagedSpawn(lifecycleIdentity, idempotencyKey!);
+			if (managedDenied) return finish(managedDenied);
 			return finish(
-				await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery),
+				await this.#driveVerifiedSpawn(lifecycleIdentity, admission, inFlight, owner => {
+					becameOwner = owner;
+				}),
 			);
 		} catch {
 			return finish(error("spawn_failed", "session.spawn admission could not be durably established"));
@@ -1525,6 +1592,641 @@ export class Broker {
 			this.#spawnTasks.delete(inFlight);
 			this.#spawnInFlight.delete(lifecycleIdentity);
 			if (becameOwner) await this.#spawnAuthority?.releaseOwner(lifecycleIdentity);
+		}
+	}
+	async #denyOrdinaryManagedSpawn(lifecycleIdentity: string, callerKey: string): Promise<BrokerResponse | undefined> {
+		if (this.#managedAttempts.has(lifecycleIdentity))
+			return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
+		if (this.#managedEnrollmentFailed) return error("spawn_failed", "managed enrollment membership is unprovable");
+		let enrolled: ManagedEnrollmentRecord;
+		try {
+			enrolled = await loadManagedEnrollmentRecord(this.settings.agentDir);
+		} catch {
+			return error("spawn_failed", "managed enrollment membership is unprovable");
+		}
+		if (enrolled.nativeIdentities.includes(lifecycleIdentity))
+			return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
+		for (const root of enrolled.controlRoots) {
+			if (this.#managedFailedRoots.has(root)) continue;
+			try {
+				const scopedIdentity = await deriveScopedIdempotencyIdentity(
+					this.settings.agentDir,
+					"session.spawn",
+					callerKey,
+					root,
+				);
+				if (this.#managedAttempts.has(scopedIdentity) || enrolled.nativeIdentities.includes(scopedIdentity))
+					return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
+				const read = await readExistingStateForMutation(managedTaskDomainPath(root));
+				if (read.kind !== "valid") continue;
+				const state = validateManagedTaskDomain(read.value);
+				const attempt =
+					lookupManagedAttemptByNativeIdentity(state, lifecycleIdentity) ??
+					lookupManagedAttemptByNativeIdentity(state, scopedIdentity) ??
+					state.graphs.flatMap(graph => graph.attempts).find(item => item.native.key === callerKey);
+				if (attempt) return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
+			} catch {}
+		}
+		return undefined;
+	}
+
+	async #driveVerifiedSpawn(
+		lifecycleIdentity: string,
+		admission: SpawnAdmissionInput,
+		inFlight: SpawnInFlight,
+		setOwner: (owned: boolean) => void,
+	): Promise<BrokerResponse> {
+		const key = await getBrokerIdentityKey(this.settings.agentDir);
+		const authority = this.#spawnAuthority;
+		if (!authority) return error("unavailable", "spawn authority is unavailable");
+		const requestBindingMac = spawnBindingMac(
+			key,
+			admission,
+			admission.modelId ?? null,
+			admission.modelPreset ?? null,
+		);
+		const existing = authority.claim(lifecycleIdentity);
+		const resolveModels = async (): Promise<BrokerResponse | undefined> => {
+			if (admission.modelPreset !== undefined) {
+				const validated = validateBrokerModelPresetSync(this.settings.agentDir, admission.modelPreset);
+				if (isBrokerResponse(validated)) return validated;
+				admission.modelPreset = validated;
+			}
+			if (admission.modelId !== undefined) {
+				const resolved = await this.#resolveModelPin(admission.modelId, { cwd: admission.cwd });
+				if (!resolved.ok) return error("unknown_model", resolved.error);
+				if (resolved.model === null) return error("unknown_model", "session.spawn modelId could not be resolved.");
+				admission.modelId = resolved.model;
+			}
+			return undefined;
+		};
+		let decision: SpawnClaimDecision | undefined;
+		if (existing !== undefined) {
+			let existingBindingMac: string | undefined;
+			if (existing.requestBindingMac === undefined) {
+				const modelError = await resolveModels();
+				if (modelError) return modelError;
+				existingBindingMac = spawnBindingMac(
+					key,
+					admission,
+					admission.modelId ?? null,
+					admission.modelPreset ?? null,
+				);
+			}
+			decision = await authority.claimOrJoin(
+				lifecycleIdentity,
+				existingBindingMac,
+				existingBindingMac ?? requestBindingMac,
+			);
+			if (decision.kind === "owner") {
+				setOwner(true);
+				const modelError = await resolveModels();
+				if (modelError) return modelError;
+				const recoveredBindingMac = spawnBindingMac(
+					key,
+					admission,
+					admission.modelId ?? null,
+					admission.modelPreset ?? null,
+				);
+				if (recoveredBindingMac !== decision.claim.bindingMac)
+					return error("idempotency_conflict", "session.spawn model selection differs from its durable claim");
+			}
+		} else {
+			const modelError = await resolveModels();
+			if (modelError) {
+				const raced = authority.claim(lifecycleIdentity);
+				if (raced === undefined) return modelError;
+				decision = await authority.claimOrJoin(lifecycleIdentity, undefined, requestBindingMac);
+				if (decision.kind === "owner") {
+					setOwner(true);
+					return modelError;
+				}
+			} else {
+				const bindingMac = spawnBindingMac(
+					key,
+					admission,
+					admission.modelId ?? null,
+					admission.modelPreset ?? null,
+				);
+				decision = await authority.claimOrJoin(lifecycleIdentity, bindingMac, requestBindingMac);
+			}
+		}
+		if (!decision) return error("spawn_failed", "session.spawn admission could not be durably established");
+		if (decision.kind === "managed_key_conflict")
+			return error("idempotency_conflict", "idempotency key is reserved by a managed task.dag attempt");
+		if (decision.kind === "idempotency_conflict")
+			return error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim");
+		if (decision.kind === "in_progress")
+			return error("spawn_in_progress", `session.spawn is ${decision.claim.state}`);
+		if (decision.kind === "terminal_uncertain") {
+			if (decision.claim.substrateProof !== undefined && decision.claim.authorityRef === undefined)
+				return await this.#reconcileUncertainRegistration(lifecycleIdentity, decision.claim);
+			return error("terminal_uncertain", "session.spawn outcome is uncertain");
+		}
+		if (decision.kind === "terminal") return this.#spawnTerminalResponse(decision.claim);
+		if (decision.kind === "replay") return await this.#reconcileSpawnReplay(lifecycleIdentity, decision.claim);
+		setOwner(true);
+		inFlight.claimId = decision.claim.claimId;
+		inFlight.phase = decision.claim.state;
+		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac);
+		return await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery);
+	}
+
+	async #handleManagedTaskDag(
+		input: Record<string, unknown>,
+		idempotencyKey: string | undefined,
+	): Promise<BrokerResponse> {
+		if (input.action === "define") return this.#managedDefine(input);
+		if (input.action === "advance") return this.#managedAdvance(input, idempotencyKey);
+		if (input.action === "status") return this.#managedStatus(input);
+		if (input.action === "revise") return this.#managedRevise(input);
+		if (input.action === "cancel") return this.#managedCancel(input);
+		if (input.action === "verify") return this.#managedVerify(input);
+		return error("invalid_input", "unknown task.dag action");
+	}
+
+	async #verifiedManagedOwner(input: Record<string, unknown>): Promise<VerifiedManagedOwner> {
+		const ownerSessionId = input.ownerSessionId;
+		const attestationEpoch = input.attestationEpoch;
+		const masterCapability = input.masterCapability;
+		const controlRoot = input.controlRoot;
+		const enrollmentId = input.enrollmentId;
+		if (
+			typeof ownerSessionId !== "string" ||
+			!isCanonicalSessionId(ownerSessionId) ||
+			typeof attestationEpoch !== "string" ||
+			attestationEpoch.length === 0 ||
+			attestationEpoch.length > 512 ||
+			typeof masterCapability !== "string" ||
+			masterCapability.length === 0 ||
+			masterCapability.length > 16_384 ||
+			typeof controlRoot !== "string" ||
+			!path.isAbsolute(controlRoot) ||
+			path.normalize(controlRoot) !== controlRoot ||
+			typeof enrollmentId !== "string" ||
+			enrollmentId.trim().length === 0 ||
+			enrollmentId.length > 256
+		)
+			return { kind: "denied", response: error("invalid_input", "task.dag authorization is invalid") };
+		if ("accepted" in input || "pass" in input || "receipt" in input)
+			return { kind: "denied", response: error("invalid_input", "public verification material is not authority") };
+		if (input.worktrees !== undefined) {
+			if (!Array.isArray(input.worktrees) || input.worktrees.length === 0)
+				return { kind: "denied", response: error("invalid_input", "worktrees are invalid") };
+			if (
+				input.worktrees.some(
+					value => typeof value !== "string" || !path.isAbsolute(value) || path.normalize(value) !== value,
+				)
+			)
+				return { kind: "denied", response: error("invalid_input", "worktrees are invalid") };
+		}
+		if (input.aliases !== undefined) {
+			if (!Array.isArray(input.aliases))
+				return { kind: "denied", response: error("invalid_input", "aliases are invalid") };
+			if (
+				input.aliases.some(
+					value =>
+						typeof value !== "string" || value.length === 0 || path.normalize(value) !== path.resolve(value),
+				)
+			)
+				return { kind: "denied", response: error("invalid_input", "aliases are invalid") };
+		}
+		let allowed = false;
+		try {
+			allowed = (await this.verifyMasterCapability(ownerSessionId, masterCapability, attestationEpoch)).allowed;
+		} finally {
+			if (typeof input.masterCapability === "string") input.masterCapability = "";
+		}
+		if (!allowed)
+			return { kind: "denied", response: error("spawn_failed", "master capability verification was denied") };
+		const worktrees = Array.isArray(input.worktrees)
+			? input.worktrees.filter((value): value is string => typeof value === "string" && value.length > 0)
+			: [controlRoot];
+		const aliases = Array.isArray(input.aliases)
+			? input.aliases.filter((value): value is string => typeof value === "string" && value.length > 0)
+			: undefined;
+		return {
+			kind: "verified",
+			ownerSessionId,
+			attestationEpoch,
+			controlRoot,
+			enrollmentId,
+			worktrees: worktrees.length > 0 ? worktrees : [controlRoot],
+			...(aliases && aliases.length > 0 ? { aliases } : {}),
+		};
+	}
+
+	#managedPublic(
+		stateRevision: number,
+		graphs: Array<{ id: string; revision: number; attempts: ManagedTaskAttempt[] }>,
+	): Record<string, unknown> {
+		return {
+			stateRevision,
+			graphs: graphs.map(graph => ({
+				id: graph.id,
+				revision: graph.revision,
+				attempts: graph.attempts.length,
+				nativeRefs: graph.attempts.map(attempt => attempt.native.identity),
+				fences: graph.attempts.map(attempt => attempt.fence),
+				validations: graph.attempts.map(attempt => attempt.validation),
+				accepted: graph.attempts.map(attempt => attempt.accepted !== null),
+			})),
+		};
+	}
+
+	async #managedDefine(input: Record<string, unknown>): Promise<BrokerResponse> {
+		if (
+			typeof input.expectedRevision !== "number" ||
+			!Number.isSafeInteger(input.expectedRevision) ||
+			input.expectedRevision < 0
+		)
+			return error("invalid_input", "expectedRevision is required");
+		if (typeof input.graphId !== "string" || input.graphId.trim().length === 0)
+			return error("invalid_input", "graphId is required");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			let rootWasEstablished = false;
+			try {
+				rootWasEstablished = (await loadManagedEnrollmentRecord(this.settings.agentDir)).establishedRoots.includes(
+					binding.controlRoot,
+				);
+			} catch {
+				throw new Error("native managed evidence exists");
+			}
+			// Publish the enrollment before the first domain snapshot.  The index is
+			// the recovery root list, so this ordering leaves only a recoverable
+			// stale index entry if the process dies before the state publication.
+			await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot);
+			const result = await transactManagedTaskDomain(
+				{
+					binding,
+					expectedRevision: input.expectedRevision,
+					...(input.expectedRevision === 0
+						? {
+								assertNoManagedEvidence: async () => {
+									let enrolled: ManagedEnrollmentRecord;
+									try {
+										enrolled = await loadManagedEnrollmentRecord(this.settings.agentDir);
+									} catch {
+										throw new Error("native managed evidence exists");
+									}
+									if (
+										rootWasEstablished ||
+										enrolled.establishedRoots.includes(binding.controlRoot) ||
+										enrolled.publishingRoots.includes(binding.controlRoot) ||
+										(enrolled.byRoot[binding.controlRoot] ?? []).length > 0
+									)
+										throw new Error("native managed evidence exists");
+									await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot);
+								},
+								beforeFirstPublication: async () => {
+									await markManagedEnrollmentPublishing(this.settings.agentDir, binding.controlRoot);
+								},
+								onFirstPublication: async () => {
+									await markManagedEnrollmentEstablished(this.settings.agentDir, binding.controlRoot);
+								},
+								onFirstPublicationAborted: async () => {
+									await markManagedEnrollmentPending(this.settings.agentDir, binding.controlRoot);
+								},
+							}
+						: {}),
+				},
+				async state =>
+					defineManagedTaskGraph(state, {
+						id: input.graphId as string,
+						owner: auth.ownerSessionId,
+						nodes: input.nodes,
+					}),
+			);
+			await markManagedEnrollmentEstablished(this.settings.agentDir, binding.controlRoot);
+			return {
+				ok: true,
+				result: {
+					...this.#managedPublic(result.state.state_revision, result.state.graphs),
+					graphId: result.result.id,
+				},
+			};
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed define failed");
+		}
+	}
+
+	async #managedAdvance(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
+		if (!idempotencyKey || idempotencyKey.length > 512)
+			return error("invalid_input", "idempotencyKey is required for task.dag advance");
+		if (
+			typeof input.expectedRevision !== "number" ||
+			!Number.isSafeInteger(input.expectedRevision) ||
+			input.expectedRevision < 0
+		)
+			return error("invalid_input", "expectedRevision is required");
+		if (typeof input.graphId !== "string" || typeof input.nodeId !== "string")
+			return error("invalid_input", "graphId and nodeId are required");
+		const maxAdmissions = input.maxAdmissions === undefined ? 1 : input.maxAdmissions;
+		if (typeof maxAdmissions !== "number" || !Number.isSafeInteger(maxAdmissions) || maxAdmissions < 1)
+			return error("invalid_input", "maxAdmissions is invalid");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const scopedIdentity = await deriveScopedIdempotencyIdentity(
+				this.settings.agentDir,
+				"session.spawn",
+				idempotencyKey,
+				binding.controlRoot,
+			);
+			const ordinaryAliases = await Promise.all([
+				deriveIdempotencyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey),
+				deriveLegacyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey),
+			]);
+			const authority = this.#spawnAuthority;
+			if (!authority) return error("unavailable", "spawn authority is unavailable");
+			const requestHash = managedIdentity({
+				graphId: input.graphId,
+				nodeId: input.nodeId,
+				ownerSessionId: auth.ownerSessionId,
+				controlRoot: binding.controlRoot,
+			});
+			const active = this.#spawnInFlight.get(scopedIdentity);
+			if (active) {
+				if (active.managedRequestHash !== requestHash)
+					return error("idempotency_conflict", "idempotency key conflicts with a live managed task.dag advance");
+				return await active.completion;
+			}
+			const reserved = await transactManagedTaskDomain(
+				{ binding, expectedRevision: input.expectedRevision },
+				async state => {
+					const graph = state.graphs.find(item => item.id === input.graphId);
+					if (!graph) throw new Error("graph owner mismatch");
+					const node = graph.nodes.find(item => item.definition.id === input.nodeId);
+					if (!node) throw new Error("node not ready");
+					const workspace = path.resolve(node.definition.workspace);
+					if (typeof input.cwd === "string" && input.cwd.length > 0 && path.resolve(input.cwd) !== workspace)
+						throw new Error("cwd must match admitted workspace");
+					const prior = state.graphs
+						.flatMap(item => item.attempts)
+						.find(
+							attempt =>
+								!attempt.retired &&
+								attempt.native.key === idempotencyKey &&
+								attempt.native.requestHash === requestHash &&
+								attempt.nodeId === input.nodeId &&
+								attempt.id === `attempt-${idempotencyKey}`,
+						);
+					const admitted = await observeOrAdmitManagedTask(state, {
+						graphId: graph.id,
+						owner: auth.ownerSessionId,
+						nodeId: input.nodeId as string,
+						attemptId: `attempt-${idempotencyKey}`,
+						native: {
+							key: idempotencyKey,
+							identity: prior?.native.identity ?? scopedIdentity,
+							requestHash,
+						},
+					});
+					if (
+						!(await authority.reserveManagedKeyAliases(
+							ordinaryAliases,
+							admitted.nativeIdentity,
+							binding.controlRoot,
+						))
+					)
+						throw new Error("idempotency key conflicts with an existing ordinary session.spawn claim");
+					return admitted;
+				},
+			);
+			const attemptRef = reserved.result;
+			if (
+				!managedAttemptRefMatches(
+					attemptRef,
+					reserved.state.graphs.flatMap(g => g.attempts).find(a => a.id === attemptRef.attemptId)!,
+					binding,
+				)
+			)
+				return error("spawn_failed", "managed attempt ref mismatch");
+			const activeAfterAdmission = this.#spawnInFlight.get(attemptRef.nativeIdentity);
+			if (activeAfterAdmission) {
+				if (activeAfterAdmission.managedRequestHash !== requestHash)
+					return error("idempotency_conflict", "idempotency key conflicts with a live managed task.dag advance");
+				return await activeAfterAdmission.completion;
+			}
+			const node = reserved.state.graphs
+				.find(graph => graph.id === attemptRef.graphId)
+				?.nodes.find(item => item.definition.id === attemptRef.nodeId);
+			const persisted = reserved.state.graphs
+				.flatMap(graph => graph.attempts)
+				?.find(item => item.id === attemptRef.attemptId);
+			if (!node || !persisted) return error("spawn_failed", "admitted node missing");
+			this.#managedAttempts.set(attemptRef.nativeIdentity, attemptRef);
+			const spawnAdmission: SpawnAdmissionInput = {
+				task: node.definition.task,
+				masterCapability: "",
+				ownerSessionId: auth.ownerSessionId,
+				attestationEpoch: auth.attestationEpoch,
+				cwd: path.resolve(node.definition.workspace),
+				managedAttempt: attemptRef,
+				managedBinding: binding,
+				managedNativeVector: managedNativeVector(persisted),
+			};
+			const completion = Promise.withResolvers<BrokerResponse>();
+			const inFlight: SpawnInFlight = {
+				completion: completion.promise,
+				resolve: completion.resolve,
+				managedRequestHash: requestHash,
+			};
+			this.#spawnInFlight.set(attemptRef.nativeIdentity, inFlight);
+			this.#spawnTasks.set(inFlight, spawnAdmission.task);
+			let becameOwner = false;
+			let completionResult: BrokerResponse = error("spawn_failed", "managed advance did not complete");
+			try {
+				await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot, attemptRef.nativeIdentity);
+				const driven = await this.#driveVerifiedSpawn(
+					attemptRef.nativeIdentity,
+					spawnAdmission,
+					inFlight,
+					owner => {
+						becameOwner = owner;
+					},
+				);
+				completionResult = driven;
+				if (!driven.ok) return driven;
+				const liveRevision = await currentManagedRevision(binding);
+				completionResult = {
+					ok: true,
+					result: {
+						...this.#managedPublic(liveRevision, reserved.state.graphs),
+						attemptId: attemptRef.attemptId,
+						nativeIdentity: attemptRef.nativeIdentity,
+						spawn: driven.result,
+					},
+				};
+				return completionResult;
+			} catch (caught) {
+				completionResult = error(
+					"spawn_failed",
+					caught instanceof Error ? caught.message : "managed advance failed",
+				);
+				throw caught;
+			} finally {
+				completion.resolve(completionResult);
+				this.#spawnTasks.delete(inFlight);
+				if (this.#spawnInFlight.get(attemptRef.nativeIdentity) === inFlight)
+					this.#spawnInFlight.delete(attemptRef.nativeIdentity);
+				if (becameOwner) await this.#spawnAuthority?.releaseOwner(attemptRef.nativeIdentity);
+			}
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed advance failed");
+		}
+	}
+
+	async #managedStatus(input: Record<string, unknown>): Promise<BrokerResponse> {
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const target = managedTaskDomainPath(binding.controlRoot);
+			const state = await withWorkflowStateLock(
+				target,
+				async () => {
+					const read = await readExistingStateForMutation(target);
+					if (read.kind !== "valid") throw new Error("established authority missing");
+					const parsed = validateManagedTaskDomain(read.value);
+					if (managedIdentity(parsed.binding) !== managedIdentity(binding))
+						throw new Error("domain binding mismatch");
+					return parsed;
+				},
+				{ cwd: binding.controlRoot, privateDurable: { directory: path.dirname(target) } },
+			);
+			return { ok: true, result: this.#managedPublic(state.state_revision, state.graphs) };
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed status failed");
+		}
+	}
+
+	async #managedRevise(input: Record<string, unknown>): Promise<BrokerResponse> {
+		if (typeof input.expectedRevision !== "number" || !Number.isSafeInteger(input.expectedRevision))
+			return error("invalid_input", "expectedRevision is required");
+		if (typeof input.graphId !== "string") return error("invalid_input", "graphId is required");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		if (this.#managedEnrollmentFailed || this.#managedFailedRoots.has(auth.controlRoot))
+			return error("terminal_uncertain", "managed enrollment membership is unprovable; revision was not applied");
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const result = await transactManagedTaskDomain(
+				{ binding, expectedRevision: input.expectedRevision },
+				async state => {
+					const graph = state.graphs.find(item => item.id === input.graphId);
+					if (!graph || graph.owner !== auth.ownerSessionId) throw new Error("graph owner mismatch");
+					return reviseManagedTaskGraph(state, graph, input.nodes);
+				},
+			);
+			if (!(await this.#closeManagedAttempts(binding.controlRoot, input.graphId as string, result.result)))
+				return error("terminal_uncertain", "managed child close remains unresolved after graph revision");
+			return {
+				ok: true,
+				result: {
+					...this.#managedPublic(result.state.state_revision, result.state.graphs),
+					affected: result.result,
+				},
+			};
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed revise failed");
+		}
+	}
+
+	async #managedCancel(input: Record<string, unknown>): Promise<BrokerResponse> {
+		if (typeof input.expectedRevision !== "number" || !Number.isSafeInteger(input.expectedRevision))
+			return error("invalid_input", "expectedRevision is required");
+		if (typeof input.graphId !== "string") return error("invalid_input", "graphId is required");
+		const ids = Array.isArray(input.nodeIds)
+			? input.nodeIds.filter((value): value is string => typeof value === "string")
+			: [];
+		if (ids.length === 0) return error("invalid_input", "nodeIds are required");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		if (this.#managedEnrollmentFailed || this.#managedFailedRoots.has(auth.controlRoot))
+			return error(
+				"terminal_uncertain",
+				"managed enrollment membership is unprovable; cancellation was not applied",
+			);
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const result = await transactManagedTaskDomain(
+				{ binding, expectedRevision: input.expectedRevision },
+				async state => {
+					const graph = state.graphs.find(item => item.id === input.graphId);
+					if (!graph || graph.owner !== auth.ownerSessionId) throw new Error("graph owner mismatch");
+					return cancelManagedTasks(graph, ids);
+				},
+			);
+			if (!(await this.#closeManagedAttempts(binding.controlRoot, input.graphId as string, result.result)))
+				return error("terminal_uncertain", "managed child close remains unresolved after cancellation");
+			return {
+				ok: true,
+				result: {
+					...this.#managedPublic(result.state.state_revision, result.state.graphs),
+					affected: result.result,
+				},
+			};
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed cancel failed");
+		}
+	}
+	async #managedVerify(input: Record<string, unknown>): Promise<BrokerResponse> {
+		if (typeof input.graphId !== "string" || typeof input.nodeId !== "string")
+			return error("invalid_input", "graphId and nodeId are required");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const verified = await verifyManagedTaskAttempt({
+				binding,
+				graphId: input.graphId,
+				nodeId: input.nodeId,
+				owner: auth.ownerSessionId,
+			});
+			return { ok: true, result: { ...verified, commandsStarted: verified.started } };
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed verify failed");
 		}
 	}
 
@@ -1558,6 +2260,53 @@ export class Broker {
 				? spawnFailureError(claim.failure)
 				: error("spawn_failed", "session.spawn was rejected before seed handoff");
 		return error("resource_gone", "session.spawn claim is closed");
+	}
+
+	/** Re-prove an unbound launch on an idempotent retry instead of fencing it forever. */
+	async #reconcileUncertainRegistration(lifecycleIdentity: string, claim: SpawnClaimV2): Promise<BrokerResponse> {
+		const proof = claim.substrateProof;
+		if (claim.state !== "uncertain" || claim.authorityRef !== undefined || !claim.childId || proof === undefined)
+			return error("terminal_uncertain", "session.spawn registration authority is unavailable for reconciliation");
+		const provider = this.#spawnSubstrateProvider();
+		let verdict: "verified" | "mismatch" | "gone";
+		try {
+			verdict = await provider.verify(proof);
+		} catch {
+			return error("terminal_uncertain", "session.spawn registration proof could not be re-verified");
+		}
+		if (verdict === "mismatch")
+			return error("terminal_uncertain", "session.spawn registration proof no longer matches the launch");
+		if (verdict === "verified") {
+			try {
+				const closed = await provider.close(proof);
+				if (!closed.ok)
+					return error(
+						"terminal_uncertain",
+						"session.spawn child registration remains unresolved after the bounded close attempt",
+					);
+			} catch {
+				return error("terminal_uncertain", "session.spawn child registration close could not be verified");
+			}
+		}
+		const failure: SpawnSubstrateFailure = {
+			substrateKind: proof.substrateKind,
+			code: "child_registration_reconciled_failed",
+			message:
+				verdict === "gone"
+					? "session.spawn child host exited before registration"
+					: "session.spawn child host was closed before registration",
+		};
+		try {
+			await this.#spawnAuthority?.persistTransition(lifecycleIdentity, {
+				claimId: claim.claimId,
+				from: "uncertain",
+				to: "pre_send_rejected",
+				failure,
+			});
+		} catch {
+			return error("terminal_uncertain", "session.spawn registration reconciliation could not be persisted");
+		}
+		return spawnFailureError(failure);
 	}
 
 	#spawnSubstrateProvider(): SpawnSubstrateProvider {
@@ -1595,14 +2344,39 @@ export class Broker {
 					...(admission.modelId === undefined ? {} : { modelId: admission.modelId }),
 					...(admission.modelPreset === undefined ? {} : { modelPreset: admission.modelPreset }),
 				});
-				current = (
-					await store.persistTransition(lifecycleIdentity, {
-						claimId: current.claimId,
-						from: "prepared",
-						to: "substrate_starting",
-						childId: prep.childId,
-					})
-				).claim;
+				if (admission.managedAttempt && admission.managedBinding && admission.managedNativeVector) {
+					try {
+						current = await withManagedNativeEffectAuthorized(
+							admission.managedBinding,
+							admission.managedAttempt.nativeIdentity,
+							admission.managedNativeVector,
+							"launch",
+							async () =>
+								(
+									await store.persistTransition(lifecycleIdentity, {
+										claimId: current.claimId,
+										from: "prepared",
+										to: "substrate_starting",
+										childId: prep.childId,
+									})
+								).claim,
+						);
+					} catch (caught) {
+						return error(
+							"spawn_failed",
+							caught instanceof Error ? caught.message : "managed native fence denied",
+						);
+					}
+				} else {
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "prepared",
+							to: "substrate_starting",
+							childId: prep.childId,
+						})
+					).claim;
+				}
 				inFlight.phase = current.state;
 				const launched = await provider.launch({
 					childSessionId: prep.childId,
@@ -1635,8 +2409,26 @@ export class Broker {
 						code: "substrate_proof_failed",
 						message: "session.spawn substrate lacks lifecycle process authority",
 					};
-					await this.#releaseUnownedSubstrate(provider, launchedProof);
-					launchedProof = undefined;
+					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+					if (release === "unresolved") {
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+								failure: {
+									substrateKind: launched.proof.substrateKind,
+									code: "child_registration_release_unproven",
+									message: "session.spawn child registration could not prove substrate release",
+								},
+							})
+						).claim;
+						launchedProof = undefined;
+						return error(
+							"terminal_uncertain",
+							"session.spawn substrate release could not be proven after the launch proof failed",
+						);
+					}
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
@@ -1645,7 +2437,67 @@ export class Broker {
 							failure,
 						})
 					).claim;
+					launchedProof = undefined;
 					return spawnFailureError(failure);
+				}
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "substrate_starting",
+						to: "substrate_starting",
+						childId: prep.childId,
+						substrateProof: launched.proof,
+					})
+				).claim;
+				inFlight.phase = current.state;
+				if (admission.managedAttempt && admission.managedBinding) {
+					let attempt: ManagedTaskAttempt | undefined;
+					try {
+						attempt = await inspectManagedAttemptByNativeIdentity(
+							admission.managedBinding,
+							admission.managedAttempt.nativeIdentity,
+						);
+					} catch {
+						// A failed fence read cannot prove the launch is still authorized.
+					}
+					if (attempt?.fence !== "current" || attempt?.retired) {
+						const release = await this.#releaseUnownedSubstrate(provider, launched.proof);
+						let gone = release === "gone";
+						if (release === "closed") {
+							try {
+								gone = (await provider.verify(launched.proof)) === "gone";
+							} catch {
+								gone = false;
+							}
+						}
+						if (gone) {
+							current = (
+								await store.persistTransition(lifecycleIdentity, {
+									claimId: current.claimId,
+									from: "substrate_starting",
+									to: "closed",
+								})
+							).claim;
+							inFlight.phase = current.state;
+							launchedProof = undefined;
+							return error("spawn_failed", "managed attempt was fenced while its child was launching");
+						}
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+								failure: {
+									substrateKind: launched.proof.substrateKind,
+									code: "managed_child_close_unresolved",
+									message: "managed child close could not be proven after its attempt was fenced",
+								},
+							})
+						).claim;
+						inFlight.phase = current.state;
+						launchedProof = undefined;
+						return error("terminal_uncertain", "managed child close is unresolved after its attempt was fenced");
+					}
 				}
 				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
@@ -1656,18 +2508,44 @@ export class Broker {
 				});
 				if (!registration.ok) {
 					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
-					await this.#releaseUnownedSubstrate(provider, launchedProof);
-					launchedProof = undefined;
+					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+					if (release === "closed" || release === "gone") {
+						const failure: SpawnSubstrateFailure = {
+							substrateKind: launched.proof.substrateKind,
+							code: startupFailure === undefined ? "child_registration_timeout" : "child_registration_failed",
+							message:
+								startupFailure === undefined
+									? "session.spawn child host did not register before the bounded admission deadline"
+									: `session.spawn child host failed during ${startupFailure.phase}/${startupFailure.reason}`,
+						};
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "pre_send_rejected",
+								failure,
+							})
+						).claim;
+						launchedProof = undefined;
+						return spawnFailureError(failure);
+					}
+					const unresolvedRelease: SpawnSubstrateFailure = {
+						substrateKind: launched.proof.substrateKind,
+						code: "child_registration_release_unproven",
+						message: "session.spawn child registration could not prove substrate release",
+					};
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
 							from: "substrate_starting",
 							to: "uncertain",
+							failure: unresolvedRelease,
 						})
 					).claim;
+					launchedProof = undefined;
 					return error(
 						"terminal_uncertain",
-						"session.spawn child registration is uncertain" +
+						"session.spawn child registration is uncertain (substrate release could not be proven)" +
 							(startupFailure ? ` (${startupFailure.phase}/${startupFailure.reason})` : ""),
 					);
 				}
@@ -1766,26 +2644,59 @@ export class Broker {
 			}
 			const childId = current.childId;
 			const preparedSeed = current.seed;
+			const preSendLeaseEpoch = current.preSendLease.epoch;
+			const exactPinnedRegistration = pinnedRegistration;
 			// Dispatch without a complete pin must never consume the pre-send lease.
-			if (pinnedRegistration === undefined)
+			if (exactPinnedRegistration === undefined)
 				return error("terminal_uncertain", "session.spawn endpoint pin is unavailable before dispatch");
-			current = (
-				await store.persistTransition(lifecycleIdentity, {
-					claimId: current.claimId,
-					from: "seed_prepared",
-					to: "dispatching",
-					leaseEpoch: current.preSendLease.epoch,
-					seed: { ...preparedSeed, phase: "dispatching" },
-				})
-			).claim;
-			inFlight.phase = current.state;
-			handedOff = true;
-			const dispatched = await this.#spawnPromptLayer.dispatch({
-				sessionId: childId,
-				task: admission.task,
-				clientRef: preparedSeed.clientRef,
-				pinned: pinnedRegistration,
-			});
+			const dispatchSeed = async (): Promise<SpawnPromptDispatch> =>
+				await this.#spawnPromptLayer.dispatch({
+					sessionId: childId,
+					task: admission.task,
+					clientRef: preparedSeed.clientRef,
+					pinned: exactPinnedRegistration,
+				});
+			let dispatched: SpawnPromptDispatch;
+			if (admission.managedAttempt && admission.managedBinding && admission.managedNativeVector) {
+				try {
+					dispatched = await withManagedNativeEffectAuthorized(
+						admission.managedBinding,
+						admission.managedAttempt.nativeIdentity,
+						admission.managedNativeVector,
+						"seed",
+						async () => {
+							current = (
+								await store.persistTransition(lifecycleIdentity, {
+									claimId: current.claimId,
+									from: "seed_prepared",
+									to: "dispatching",
+									leaseEpoch: preSendLeaseEpoch,
+									seed: { ...preparedSeed, phase: "dispatching" },
+								})
+							).claim;
+							inFlight.phase = current.state;
+							handedOff = true;
+							return await dispatchSeed();
+						},
+					);
+				} catch (caught) {
+					if (handedOff) throw caught;
+					return error("spawn_failed", caught instanceof Error ? caught.message : "managed native fence denied");
+				}
+			} else {
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "seed_prepared",
+						to: "dispatching",
+						leaseEpoch: current.preSendLease.epoch,
+						seed: { ...preparedSeed, phase: "dispatching" },
+					})
+				).claim;
+				inFlight.phase = current.state;
+				handedOff = true;
+				dispatched = await dispatchSeed();
+			}
 			if (dispatched.kind === "accepted") {
 				current = (
 					await store.persistTransition(lifecycleIdentity, {
@@ -1833,15 +2744,76 @@ export class Broker {
 		} catch {
 			// Once a substrate exists the outcome is ambiguous even before handoff:
 			// reporting an ordinary failure would downgrade retained uncertainty.
-			const ambiguous = handedOff || launchedProof !== undefined;
+			let ambiguous = handedOff || launchedProof !== undefined;
 			// A launched substrate with no persisted authority is invisible to the
 			// reaper, so in-process cleanup is its only chance. This must run on
 			// EVERY post-launch failure exit, not just a returned registration
 			// failure: a throw from awaitRegistration, verify, close, or a durable
 			// transition all land here.
-			if (!handedOff) await this.#releaseUnownedSubstrate(provider, launchedProof);
+			if (!handedOff) {
+				const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+				if ((release === "closed" || release === "gone") && current.state === "substrate_starting") {
+					const failure: SpawnSubstrateFailure = {
+						substrateKind: launchedProof?.substrateKind ?? "headless",
+						code: "child_registration_failed",
+						message: "session.spawn child host failed before registration",
+					};
+					try {
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "pre_send_rejected",
+							failure,
+						});
+						launchedProof = undefined;
+						return spawnFailureError(failure);
+					} catch {
+						// The substrate is closed, but a failed terminal write still leaves
+						// the durable claim unresolved for the next broker recovery pass.
+					}
+				} else if (release === "unresolved" && current.state === "substrate_starting") {
+					try {
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+								failure: {
+									substrateKind: launchedProof?.substrateKind ?? "headless",
+									code: "child_registration_release_unproven",
+									message: "session.spawn child registration could not prove substrate release",
+								},
+							})
+						).claim;
+						launchedProof = undefined;
+					} catch {
+						// Preserve the generic durable-state uncertainty if the reason itself
+						// cannot be appended.
+					}
+				} else if (release === "absent" && current.state === "substrate_starting") {
+					try {
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+							})
+						).claim;
+						ambiguous = true;
+					} catch {
+						// Keep the generic failure when even the uncertainty transition cannot be written.
+					}
+				}
+			}
+			if (ambiguous && admission.managedBinding)
+				await recordManagedNativeObservation(admission.managedBinding, lifecycleIdentity, "unknown").catch(
+					() => undefined,
+				);
 			return ambiguous
-				? error("terminal_uncertain", "session.spawn state could not be advanced durably")
+				? error(
+						"terminal_uncertain",
+						current.failure?.message ?? "session.spawn state could not be advanced durably",
+					)
 				: error("spawn_failed", "session.spawn could not be advanced durably");
 		}
 	}
@@ -1855,22 +2827,26 @@ export class Broker {
 	async #releaseUnownedSubstrate(
 		provider: SpawnSubstrateProvider,
 		proof: SpawnSubstrateProof | undefined,
-	): Promise<void> {
-		if (!proof) return;
+	): Promise<"closed" | "gone" | "absent" | "unresolved"> {
+		// A launch that throws before returning proof has no substrate identity to
+		// classify as gone; keep the claim uncertain instead of fabricating a kind.
+		if (!proof) return "absent";
 		let verdict: "verified" | "mismatch" | "gone";
 		try {
 			verdict = await provider.verify(proof);
 		} catch {
 			// An unprovable substrate is never mutated; uncertainty is retained by
 			// the caller's durable transition instead.
-			return;
+			return "unresolved";
 		}
-		if (verdict !== "verified") return;
+		if (verdict === "gone") return "gone";
+		if (verdict !== "verified") return "unresolved";
 		try {
-			await provider.close(proof);
+			return (await provider.close(proof)).ok ? "closed" : "unresolved";
 		} catch {
 			// The substrate may survive. The caller still records uncertainty, which
 			// is the honest durable outcome for an unclosed unowned substrate.
+			return "unresolved";
 		}
 	}
 
@@ -2032,6 +3008,148 @@ export class Broker {
 		}
 	}
 
+	async #restoreManagedAttempts(): Promise<void> {
+		this.#managedAttempts.clear();
+		this.#managedFailedRoots.clear();
+		this.#managedEnrollmentFailed = false;
+		try {
+			const restored = await restoreManagedAttemptRefs(this.settings.agentDir);
+			for (const ref of restored.refs) this.#managedAttempts.set(ref.nativeIdentity, ref);
+			for (const root of restored.failedRoots) this.#managedFailedRoots.add(root);
+		} catch {
+			this.#managedEnrollmentFailed = true;
+		}
+	}
+
+	async #observeManagedNative(
+		lifecycleIdentity: string,
+		worker: "no-effect" | "authorized" | "unknown" | "closed",
+	): Promise<void> {
+		const ref = this.#managedAttempts.get(lifecycleIdentity);
+		if (!ref) return;
+		const binding = await loadManagedDomainBinding(ref.controlRoot);
+		if (!binding) return;
+		await recordManagedNativeObservation(binding, lifecycleIdentity, worker);
+	}
+
+	async #reconcileManagedNativeLifetimes(): Promise<void> {
+		const store = this.#spawnAuthority;
+		if (!store || this.#managedEnrollmentFailed) return;
+		for (const ref of this.#managedAttempts.values()) {
+			if (this.#managedFailedRoots.has(ref.controlRoot)) continue;
+			const binding = await loadManagedDomainBinding(ref.controlRoot);
+			if (!binding) throw new Error("managed attempt domain is unavailable during startup reconciliation");
+			const attempt = await inspectManagedAttemptByNativeIdentity(binding, ref.nativeIdentity);
+			if (!attempt) throw new Error("managed attempt authority is missing during startup reconciliation");
+			const claim = store.claim(ref.nativeIdentity);
+			if (attempt.fence !== "current" || attempt.retired) {
+				if (!claim) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "prepared") {
+					await store.persistTransition(ref.nativeIdentity, {
+						claimId: claim.claimId,
+						from: "prepared",
+						to: "closed",
+					});
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "closed" && !store.authority(ref.nativeIdentity) && !claim.substrateProof) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "pre_send_rejected" && !store.authority(ref.nativeIdentity) && !claim.substrateProof) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+				if (outcome !== "closed") {
+					await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+					throw new Error("fenced managed child could not be exactly closed during startup reconciliation");
+				}
+				await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				continue;
+			}
+			if (!claim) {
+				await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				continue;
+			}
+			if (claim.state === "uncertain" || claim.state === "dispatching" || claim.state === "substrate_starting") {
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+				continue;
+			}
+			if (claim.state === "closed") {
+				const authority = store.authority(ref.nativeIdentity);
+				if (authority?.closeState === "closed" || (!authority && claim.substrateProof))
+					await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				else if (!authority) await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+				continue;
+			}
+			if (claim.state === "pre_send_rejected") {
+				const authority = store.authority(ref.nativeIdentity);
+				if (!authority && claim.substrateProof) {
+					const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+					await this.#observeManagedNative(ref.nativeIdentity, outcome === "closed" ? "closed" : "unknown");
+				} else if (!authority) await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+				continue;
+			}
+			if (claim.state === "prepared") continue;
+			await this.#observeManagedNative(ref.nativeIdentity, "authorized");
+		}
+	}
+
+	async #closeManagedAttempts(controlRoot: string, graphId: string, nodeIds: string[]): Promise<boolean> {
+		const affected = [...this.#managedAttempts.values()].filter(
+			ref => ref.controlRoot === controlRoot && ref.graphId === graphId && nodeIds.includes(ref.nodeId),
+		);
+		let allClosed = true;
+		for (const ref of affected) {
+			const inFlight = this.#spawnInFlight.get(ref.nativeIdentity);
+			const waitMs = managedCloseWaitOverridesForTest.get(this) ?? MANAGED_CLOSE_WAIT_MS;
+			if (inFlight && !(await settlesWithin(inFlight.completion, waitMs))) {
+				this.#scheduleManagedCloseAfterFlight(ref, inFlight);
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+				allClosed = false;
+				continue;
+			}
+			const claim = this.#spawnAuthority?.claim(ref.nativeIdentity);
+			const authority = this.#spawnAuthority?.authority(ref.nativeIdentity);
+			if (!claim || (claim.state === "pre_send_rejected" && !authority && !claim.substrateProof)) {
+				try {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				} catch {
+					await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+					allClosed = false;
+				}
+				continue;
+			}
+			const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+			if (outcome === "closed") await this.#observeManagedNative(ref.nativeIdentity, "closed");
+			else {
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+				allClosed = false;
+			}
+		}
+		return allClosed;
+	}
+
+	#scheduleManagedCloseAfterFlight(ref: ManagedAttemptRef, inFlight: SpawnInFlight): void {
+		void inFlight.completion
+			.then(async () => {
+				const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+				if (outcome === "closed") await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+			})
+			.catch(async caught => {
+				logger.warn(`sdk broker: deferred managed child close failed for ${ref.nativeIdentity}: ${String(caught)}`);
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+			});
+	}
+
 	async #awaitSpawnHostRegistration(input: {
 		childId: string;
 		cwd: string;
@@ -2043,21 +3161,9 @@ export class Broker {
 				await this.index.refresh();
 				// The launch locator is authority: a same-id row registered by an
 				// unrelated workspace must never be adopted as this spawn's child.
-				const row = this.index.listSessionIdentities().find(
-					candidate =>
-						candidate.sessionId === input.childId &&
-						candidate.endpointGeneration > 0 &&
-						candidate.live &&
-						!candidate.terminal &&
-						!candidate.terminalUncertain &&
-						// Path IDENTITY, not spelling. The child publishes a
-						// realpath-canonicalized locator while the launch spec carries the
-						// caller's lexical path, so `path.resolve` never reconciles a
-						// symlinked workspace (macOS /var vs /private/var) and a
-						// legitimate child would never match.
-						resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.cwd) &&
-						resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(input.stateRoot),
-				);
+				const row = this.index
+					.listSessionIdentities()
+					.find(candidate => spawnRegistrationMatches(candidate, input));
 				if (row) {
 					const incarnation = row.hostIncarnation ?? row.processIncarnation;
 					// An incarnation-less row is incomplete endpoint evidence; a partial pin
@@ -2235,7 +3341,10 @@ export class Broker {
 		const claim = store.claims().find(candidate => candidate.childId === sessionId);
 		if (!claim) return undefined;
 		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity);
-		if (outcome === "closed") return { ok: true, result: { code: "spawn_child_closed", sessionId } };
+		if (outcome === "closed") {
+			await this.#observeManagedNative(claim.lifecycleIdentity, "closed").catch(() => undefined);
+			return { ok: true, result: { code: "spawn_child_closed", sessionId } };
+		}
 		if (outcome === "uncertain")
 			return error("terminal_uncertain", "session.close substrate identity could not be re-proven");
 		return error("close_refused", "session.close could not complete for the spawned child");
@@ -2252,8 +3361,47 @@ export class Broker {
 		try {
 			const claim = store.claim(lifecycleIdentity);
 			let authority = store.authority(lifecycleIdentity);
-			if (!claim || !authority) return "retained";
-			if (claim.state === "closed" && authority.closeState === "closed") return "closed";
+			if (!claim) return "retained";
+			if (claim.state === "closed" && (!authority || authority.closeState === "closed")) return "closed";
+			if (!authority) {
+				if (!claim.substrateProof || !claim.childId) return "retained";
+				const provider = this.#spawnSubstrateProvider();
+				const proof = claim.substrateProof;
+				let verdict: "verified" | "mismatch" | "gone";
+				try {
+					verdict = await provider.verify(proof);
+				} catch {
+					verdict = "mismatch";
+				}
+				let gone = verdict === "gone";
+				if (verdict === "verified") {
+					try {
+						gone = (await provider.close(proof)).ok && (await provider.verify(proof)) === "gone";
+					} catch {
+						gone = false;
+					}
+				}
+				if (!gone) {
+					if (claim.state !== "uncertain")
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: claim.claimId,
+							from: claim.state,
+							to: "uncertain",
+							failure: {
+								substrateKind: proof.substrateKind,
+								code: "child_close_unresolved",
+								message: "session.spawn child close could not be proven",
+							},
+						});
+					return verdict === "mismatch" ? "uncertain" : "retained";
+				}
+				await store.persistTransition(lifecycleIdentity, {
+					claimId: claim.claimId,
+					from: claim.state,
+					to: "closed",
+				});
+				return "closed";
+			}
 			if (authority.closeState === "closed") return "closed";
 			const provider = this.#spawnSubstrateProvider();
 			const proof = spawnProofFromAuthority(authority);
@@ -2280,13 +3428,11 @@ export class Broker {
 					})
 				).authority!;
 			}
-			if (verdict === "verified") {
+			if (verdict === "verified" || verdict === "gone") {
 				const closedSubstrate = await provider.close(proof);
 				if (!closedSubstrate.ok) return "retained";
-				// Signal delivery is not terminal evidence: only a second exact proof
-				// that observes this substrate gone permits the durable close.
 				if ((await provider.verify(proof)) !== "gone") return "retained";
-			}
+			} else return "retained";
 			const at = Math.max(Date.now(), authority.updatedAt + 1);
 			const closedAuthority: SpawnAuthorityV1 = { ...authority, closeState: "closed", closedAt: at, updatedAt: at };
 			const currentClaim = store.claim(lifecycleIdentity);
@@ -2617,7 +3763,20 @@ export class Broker {
 				else if (mirror.requestHash !== claim.bindingMac)
 					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
 			}
+			await this.#restoreManagedAttempts();
+			if (this.#managedEnrollmentFailed || this.#managedFailedRoots.size > 0)
+				throw new Error("Broker cannot establish complete managed enrollment membership.");
 			await this.#recoverSpawnClaims();
+			await this.#reconcileManagedNativeLifetimes();
+			const reconciledRoots = new Set<string>();
+			for (const ref of this.#managedAttempts.values()) {
+				if (this.#managedFailedRoots.has(ref.controlRoot) || reconciledRoots.has(ref.controlRoot)) continue;
+				reconciledRoots.add(ref.controlRoot);
+				try {
+					const binding = await loadManagedDomainBinding(ref.controlRoot);
+					if (binding) await reconcileRunningManagedVerification(binding);
+				} catch {}
+			}
 			const now = Date.now();
 			const incarnation = brokerProcessIncarnation(process.pid);
 			if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
@@ -3390,7 +4549,9 @@ export class Broker {
 			return error("invalid_input", "session.spawn does not support lifecycle lookup");
 		if (!LIFECYCLE_OPERATIONS.has(requestedOperation)) return error("not_found", "lifecycle operation was not found");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
-		const entry = this.ledger.get(identity);
+		const entry =
+			this.ledger.get(identity) ??
+			this.ledger.findByOperationKey(`${requestedOperation}\0${idempotencyKey}`, requestedFingerprint);
 		if (!entry) return error("not_found", "lifecycle operation was not found");
 		if (entry.fingerprint !== requestedFingerprint)
 			return error("idempotency_conflict", "lifecycle request fingerprint differs");
@@ -3436,6 +4597,7 @@ export class Broker {
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
+		if (operation === "task.dag") return this.#handleManagedTaskDag(input, idempotencyKey);
 		if (operation === "session.close") {
 			const spawnClose = await this.#maybeCloseSpawnChild(input);
 			if (spawnClose) return spawnClose;
@@ -3450,10 +4612,10 @@ export class Broker {
 				lifecycleFingerprint(lookup.operation, lookup.target),
 			);
 		}
-		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
+		const fingerprint = lifecycleFingerprint(operation, input);
 		if (operation === "session.list") {
 			if (input.cursor === undefined) await this.index.refresh();
 			const page = await this.#sessionListPage(input, this.index.listSessions());
@@ -3523,8 +4685,65 @@ export class Broker {
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
-		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
+		const identity = await deriveIdempotencyIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			operation === "session.create" ? undefined : target,
+		);
 		const operationKey = `${operation}\0${idempotencyKey}`;
+		const requestedRequestHash = createHash("sha256")
+			.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
+			.digest("hex");
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, operation, idempotencyKey);
+		const legacyTargetIdentity = await deriveLegacyTargetIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			target,
+		);
+		const metadata = {
+			operationKey,
+			fingerprint,
+			...(operation === "session.close" && typeof input.sessionId === "string"
+				? { intendedSessionId: input.sessionId }
+				: {}),
+		};
+		if (!this.ledger.get(identity)) {
+			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
+			const sameCloseSession =
+				operation === "session.close" &&
+				(matchingOperation?.intendedSessionId === input.sessionId ||
+					matchingOperation?.resultSessionId === input.sessionId);
+			if (
+				matchingOperation &&
+				!sameCloseSession &&
+				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
+			)
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			const matchingLegacy = matchingOperation;
+			if (matchingLegacy) {
+				if (matchingLegacy.identity === legacyIdentity || matchingLegacy.identity === legacyTargetIdentity)
+					await this.ledger.migrateIdentity(matchingLegacy.identity, identity, metadata);
+			} else if (this.ledger.get(legacyIdentity)) {
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			} else {
+				const legacyTargetEntry = this.ledger.get(legacyTargetIdentity);
+				if (legacyTargetEntry) {
+					if (legacyTargetEntry.requestHash !== requestedRequestHash)
+						return error("idempotency_conflict", "idempotency key was used with a different request");
+					await this.ledger.migrateIdentity(legacyTargetIdentity, identity, metadata);
+					// Exact target-derived legacy identity migrated without granting new authority.
+				} else if (
+					this.ledger.hasLegacyIdentity(
+						new Set(this.#spawnAuthority?.claims().map(claim => claim.lifecycleIdentity) ?? []),
+						{ ignoreTerminalRows: operation === "session.create" },
+					)
+				) {
+					return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
+				}
+			}
+		}
 
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
@@ -3594,7 +4813,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, { operationKey, fingerprint });
+			const begun = await this.ledger.begin(identity, requestHash, metadata);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
@@ -3710,12 +4929,21 @@ export class Broker {
 			});
 			if (isCleanupPending(response)) return response;
 			const persisted = await this.ledger.readTerminal(identity, requestHash);
-			const persistenceVerified =
-				persisted !== undefined &&
-				canonicalJson(persisted.response) === canonicalJson(storedResponse) &&
-				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
-				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
-			if (!persistenceVerified) {
+			const persistenceVerification = verifyTerminalPersistence(
+				persisted,
+				storedResponse,
+				outcome.durableEffects,
+				outcome.startupFailure,
+			);
+			if (persistenceVerification.kind === "unverified") {
+				logger.warn("sdk broker terminal persistence read-back was unavailable; preserving settled outcome", {
+					identity,
+				});
+			} else if (persistenceVerification.kind === "uncertain") {
+				logger.warn("sdk broker terminal persistence verification found conflicting evidence", {
+					identity,
+					mismatches: persistenceVerification.mismatches,
+				});
 				const uncertain = error(
 					"terminal_uncertain",
 					"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
@@ -3760,6 +4988,12 @@ export function setLockArtifactGraceForTest(broker: Broker, graceMs: number | un
 export function setLivenessGraceForTest(broker: Broker, graceMs: number | undefined): void {
 	if (graceMs === undefined) livenessGraceOverridesForTest.delete(broker);
 	else livenessGraceOverridesForTest.set(broker, graceMs);
+}
+
+/** Test-only hook for shortening the bounded wait before a deferred managed close is queued. */
+export function setManagedCloseWaitForTest(broker: Broker, waitMs: number | undefined): void {
+	if (waitMs === undefined) managedCloseWaitOverridesForTest.delete(broker);
+	else managedCloseWaitOverridesForTest.set(broker, Math.max(0, waitMs));
 }
 
 /**

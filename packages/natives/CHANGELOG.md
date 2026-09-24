@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Fixed
+
+- Bounded managed-recovery cleanup now reaps dead-process replacement evidence after a 2-hour grace and detached regular-file removal evidence after 7 days (plus 5 minutes of clock-skew margin); that seven-day TTL does not apply to quarantined directory trees. New replacement candidates record publisher PID-namespace and boot-scoped generation identities so a recycled or cross-namespace PID cannot reap a live publisher. The link fallback rolls back its new candidate link after a failed source unlink when identity checks prove that rollback safe. Legacy replacement names without namespace identity are conservatively retained, while legacy file evidence uses durable, inode-keyed first-seen markers. A descriptor-relative persistent cursor lets bounded sweeps continue across fresh reaper instances. `RecoveryFsRoot.recoveryReaperMetrics()` exposes per-sweep and cumulative file/byte counters.
+
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Fixed
+
+- Split directed SDK delivery drops into bounded, per-cause diagnostics without parsing oversized frames before the response ceiling check.
+
+### Performance
+
+- Reuse completed-line syntax checkpoints when a fenced code block grows by appending, keeping the existing synchronous colored output. Prefix edits, language/theme changes, and first-time large blocks still fully parse.
+
+## [0.17.2] - 2026-09-18
+
 ## [0.17.1] - 2026-09-17
 
 ## [0.17.0] - 2026-09-17

@@ -5,11 +5,36 @@ import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { selectCanaryTests } from "./ci-risk-canary-manifest";
+import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
 
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
+const telegramDaemonGenerationGuardFiles = new Set([
+	"scripts/telegram-daemon-generation-guard.ts",
+	"scripts/telegram-daemon-generation-manifest.json",
+	...Object.values(telegramDaemonGenerationManifest.inventory).flatMap(inventory => Object.keys(inventory)),
+	...Object.keys(telegramDaemonGenerationManifest.nativeAuthoritySha256),
+]);
+const daemonLikePathSegment = /(?:^|[-_.])daemon(?:[-_.]|$)/i;
+
+function isDaemonLikePath(changedPath: string): boolean {
+	// Keep the planner conservative for a newly-added or renamed daemon source
+	// that has not been added to the manifest yet. The exact manifest-derived set
+	// remains authoritative for known files; this fallback preserves the old
+	// daemon-name trigger so an omitted entry cannot make the guard disappear.
+	return changedPath.split("/").some(segment => daemonLikePathSegment.test(segment));
+}
+
+export function isTelegramDaemonGenerationGuardFile(changedPath: string): boolean {
+	return telegramDaemonGenerationGuardFiles.has(changedPath) || isDaemonLikePath(changedPath);
+}
+
+export function needsTelegramDaemonGenerationGuard(paths: readonly string[]): boolean {
+	return paths.some(isTelegramDaemonGenerationGuardFile);
+}
+
 // The coding-agent package has hundreds of test files; keep affected validation
 // below the shard timeout by splitting package-wide/full-workspace TypeScript
 // suites across the matrix. Dev keeps the default; Main CI full mode overrides
@@ -88,6 +113,34 @@ const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
 	"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
 ] as const;
 
+// These inputs produce, transform, or define the bundled model catalog. Partial
+// owner-test mapping misses catalog-wide contracts, so changes to these surfaces
+// run the full AI suite.
+const AI_MODEL_CATALOG_FULL_TEST_PATHS: ReadonlySet<string> = new Set([
+	"packages/ai/src/models.json",
+	"packages/ai/src/models.json.d.ts",
+	"packages/ai/src/models.ts",
+	"packages/ai/scripts/generate-models.ts",
+	"packages/ai/src/model-manager.ts",
+	"packages/ai/src/model-retirements.ts",
+	"packages/ai/src/model-thinking.ts",
+	"packages/ai/src/context-cap-policy.ts",
+	"packages/ai/src/model-pricing.ts",
+	"packages/ai/src/openai-completions-compat.ts",
+	"packages/ai/src/bedrock-claude-cache-policy.ts",
+	"packages/ai/src/providers/gitlab-duo.ts",
+	"packages/ai/src/providers/kiro-api-key.ts",
+	"packages/ai/src/providers/openai-codex/constants.ts",
+	"packages/ai/src/utils/discovery/antigravity.ts",
+	"packages/ai/src/utils/discovery/codex.ts",
+	"packages/ai/src/utils/tool-choice-capability.ts",
+]);
+const AI_PROVIDER_MODELS_PATH_PREFIX = "packages/ai/src/provider-models/";
+
+function isAiCatalogModelPath(changedPath: string): boolean {
+	return AI_MODEL_CATALOG_FULL_TEST_PATHS.has(changedPath) || changedPath.startsWith(AI_PROVIDER_MODELS_PATH_PREFIX);
+}
+
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
 	"packages/agent/src/agent.ts": [
@@ -98,7 +151,27 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
 	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
-	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
+	"packages/coding-agent/src/config/model-registry.ts": [
+		"packages/coding-agent/test/model-registry-runtime-provider.test.ts",
+		// This module owns the general-vs-profile-activation availability split, so a
+		// change here must also exercise the suite that asserts that split.
+		"packages/coding-agent/test/model-profile-activation.test.ts",
+	],
+	// Making this module asynchronous (e.g. a top-level `await import(...)`)
+	// propagates async-ness through every importer, and bun 1.4.0 drops it on the
+	// `model-registry` <-> `model-resolver` import cycle: the bundle then carries a
+	// non-async module initializer containing `await`, so every compiled binary dies
+	// at parse time with `SyntaxError: Unexpected identifier 'init_model_registry'`.
+	// Basename matching would never reach that test from this file, which is how
+	// #5674 shipped to dev. Compile-and-run coverage must run on any change here.
+	"packages/coding-agent/src/utils/mupdf-wasm.ts": [
+		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
+		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
+	],
+	"packages/coding-agent/src/utils/mupdf-wasm-embedded.ts": [
+		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
+		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
+	],
 	"packages/coding-agent/src/modes/components/model-selector.ts": [
 		"packages/coding-agent/test/model-selector-profiles-redteam.test.ts",
 		"packages/coding-agent/test/model-preset-landing-redteam-qa.test.ts",
@@ -163,7 +236,10 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/extensibility/gjc-plugins/types.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
-	"packages/coding-agent/src/sdk/session.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/sdk/session.ts": [
+		...EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+		"packages/coding-agent/test/sdk-mcp-discovery.test.ts",
+	],
 };
 
 export interface PackageManifest {
@@ -461,7 +537,15 @@ function isRustTestKey(key: string): boolean {
 
 // Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
 function taskNeedsRust(key: string): boolean {
-	return key === "rust-check" || isRustTestKey(key) || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
+	return (
+		key === "rust-check" ||
+		isRustTestKey(key) ||
+		key === "ci-selftest" ||
+		key === "ci-dry-run" ||
+		key === "affected-selftest" ||
+		key === "affected-dry-run" ||
+		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts"
+	);
 }
 
 // Build the machine-readable descriptor list for the current changed-path plan.
@@ -483,8 +567,8 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 // `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
 // by tests and for debugging). Under GitHub Actions it also appends the dev-ci
 // planner outputs: `matrix`, `has_tasks`, `has_native`, and the canonical Darwin
-// smoke flag. Downstream jobs reuse the planner's exact diff via
-// CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
+// smoke and daemon-guard flags. Downstream jobs reuse the planner's exact diff
+// via CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
 // Paths that affect the compiled tab-worker smoke graph. Keep this authoritative
 // predicate in the planner: dev-ci consumes its emitted flag rather than copying
 // path checks into individual jobs.
@@ -607,6 +691,7 @@ async function emitFullMatrix(): Promise<void> {
 		`has_native=${hasNative}`,
 		`has_python=${hasPython}`,
 		`has_risk_canaries=${hasRiskCanaries}`,
+		"has_protected_daemon_decl=true",
 		"",
 	];
 	await fs.appendFile(githubOutput, lines.join("\n"));
@@ -647,6 +732,7 @@ async function emitMatrix(): Promise<void> {
 		`has_risk_canaries=${hasRiskCanaries}`,
 		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`has_windows_session_path=${hasWindowsSessionPath}`,
+		`has_protected_daemon_decl=${needsTelegramDaemonGenerationGuard(paths)}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,
@@ -933,6 +1019,9 @@ export function planTasks(
 	if (paths.some(isSdkPackageSmokePath)) {
 		add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 	}
+	if (paths.some(isSchemaContractPath)) {
+		addSchemaSyncTask(tasks);
+	}
 
 	if (rustChanged) {
 		add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
@@ -1005,6 +1094,10 @@ export function planTargetedTasks(
 
 	for (const changedPath of relevant) {
 		if (isFullWorkspacePath(changedPath)) continue;
+		if (isAiCatalogModelPath(changedPath)) {
+			const aiPackage = packages.find(workspacePackage => workspacePackage.name === "@gajae-code/ai");
+			if (aiPackage) addPackageTestTasks(tasks, aiPackage);
+		}
 		if (isWorkflowPath(changedPath)) {
 			needYamlParse = true;
 			needCiSelftest = true;
@@ -1033,6 +1126,9 @@ export function planTargetedTasks(
 			if (isUnscopedWrapperPath(changedPath)) {
 				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
 			}
+		}
+		if (isSchemaContractPath(changedPath)) {
+			addSchemaSyncTask(tasks);
 		}
 		if (isSdkPackageSmokePath(changedPath)) {
 			add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
@@ -1161,6 +1257,7 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 	}
 
 	const total = codingAgentTestShards();
+	addTestFileTask(tasks, "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts");
 	for (let shard = 1; shard <= total; shard++) {
 		addCodingAgentTestShard(tasks, shard, total);
 	}
@@ -1348,6 +1445,18 @@ export function isFullWorkspacePath(changedPath: string): boolean {
 		"tsconfig.base.json",
 		"tsconfig.tools.json",
 	].includes(changedPath);
+}
+
+// `schemas/*.json` is generated from the settings schema by
+// `scripts/generate-json-schemas.ts`. Either side can drift from the other, and
+// the `--check` gate that catches it lives only inside `ci:check:full`, which an
+// affected-path run does not select for a change confined to these two files.
+export function isSchemaContractPath(changedPath: string): boolean {
+	return changedPath.startsWith("schemas/") || changedPath === "packages/coding-agent/src/config/settings-schema.ts";
+}
+
+function addSchemaSyncTask(tasks: Map<string, Task>): void {
+	add(tasks, "check-schemas", "Generated JSON schema sync check", ["bun", "run", "check:schemas"]);
 }
 
 function isRootPackageReleaseHarnessOnly(paths: readonly string[]): boolean {

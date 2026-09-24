@@ -11,6 +11,7 @@ import {
 	GateStoreWriteError,
 	isUnsupportedWindowsDirectorySyncError,
 	MemoryGateStore,
+	type PersistedGate,
 	WorkflowGateBroker,
 	WorkflowGateBrokerError,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
@@ -426,6 +427,36 @@ describe("WorkflowGateBroker", () => {
 		expect(store.get(gate.gate_id)).toMatchObject({ status: "accepted", advanced: true });
 	});
 
+	it("notifies the owner when recovery loses the continuation", async () => {
+		const store = new MemoryGateStore();
+		let failAdvance = true;
+		const continuationLost: PersistedGate[] = [];
+		const broker = new WorkflowGateBroker("run-recovery-loss", store, {
+			terminalizeAccepted: () => "not_published",
+			advance: () => {
+				if (failAdvance) throw new Error("temporary advance failure");
+			},
+			completeAccepted: record => {
+				throw new Error(`workflow gate ${record.gate.gate_id} lost its continuation owner`);
+			},
+			continuationLost: record => continuationLost.push(record),
+		});
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["go"] } },
+			liveContinuation(),
+		);
+
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: "go" })).rejects.toThrow(
+			"temporary advance failure",
+		);
+		expect(continuationLost).toEqual([]);
+
+		failAdvance = false;
+		await expect(broker.recover()).rejects.toThrow("lost its continuation owner");
+		expect(store.get(gate.gate_id)).toMatchObject({ status: "accepted", advanced: true });
+		expect(continuationLost).toMatchObject([{ gate: { gate_id: gate.gate_id }, status: "accepted", advanced: true }]);
+	});
+
 	it("fails closed on a malformed but valid FileGateStore document before exposure", () => {
 		const dir = mkdtempSync(path.join(tmpdir(), "gate-invalid-document-"));
 		const file = path.join(dir, "gates.json");
@@ -593,5 +624,137 @@ describe("WorkflowGateBroker", () => {
 		};
 		expect(after.counters.ralplan).toBe(before.counters.ralplan);
 		expect(after.runtimeInstanceId).toBe("8184568d-0000-4000-8000-000000000004");
+	});
+	it("strands an advanced gate as a false success when completeAccepted loses its waiter (#5599)", async () => {
+		// `resolve()` commits `advanced:true` (workflow-gate-broker.ts:1611) BEFORE it
+		// resolves the continuation waiter through `completeAccepted` (:1612). The
+		// liveness checks at :1601/:1606 run before that commit, so a fence,
+		// quarantine or session transition landing in between leaves the record
+		// durably advanced with a waiter that is never resolved.
+		//
+		// Two consequences, both asserted below, together reproduce #5599's exact
+		// symptom set: `ok:true status:"accepted"` with a real `resolved_at`, an
+		// empty `workflow.gates.list`, and an original prompt stuck `in_flight` /
+		// `receiptState:"absent"` for hours.
+		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-5599-")), "gates.json");
+		const store = new FileGateStore(file);
+		const continuationLost: PersistedGate[] = [];
+		const broker = new WorkflowGateBroker("run-5599", store, {
+			advance: () => {},
+			terminalizeAccepted: () => "not_published",
+			// Stands in for WorkflowGateEmitter.#completeAccepted, which throws
+			// exactly this way when `#waiters` no longer holds the gate id.
+			completeAccepted: record => {
+				throw new Error(`workflow gate ${record.gate.gate_id} lost its continuation owner`);
+			},
+			continuationLost: record => continuationLost.push(record),
+		});
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } },
+			liveContinuation(),
+		);
+		const response = { gate_id: gate.gate_id, answer: "approve", idempotency_key: "idem-5599" };
+
+		await expect(broker.resolve(response)).rejects.toThrow(/lost its continuation owner/);
+
+		// 1. The advance is durably committed even though no waiter was ever resolved.
+		expect(new FileGateStore(file).get(gate.gate_id)).toMatchObject({
+			status: "accepted",
+			advanced: true,
+			terminalized: true,
+		});
+		expect(continuationLost).toMatchObject([{ gate: { gate_id: gate.gate_id }, status: "accepted", advanced: true }]);
+		expect(broker.listWorkflowGateQueryRecords()).toMatchObject([
+			{
+				gate_id: gate.gate_id,
+				tag: "accepted",
+				answer_recorded: true,
+				post_accept_disposition: "continuation_lost",
+			},
+		]);
+
+		// 2. The lookup must NOT claim completion: `resolveSdkWorkflowGate`'s catch
+		//    path (sdk/host/session-runtime.ts:2166-2167) returns a `completed`
+		//    lookup as a successful resolution, which is how #5599's caller saw
+		//    `ok:true status:"accepted"` for a turn that never continued. It is
+		//    downgraded so that path instead recovers and then surfaces the
+		//    documented `terminal_uncertain`.
+		expect(broker.lookupCompletedResolution(response).kind).toBe("accepted_incomplete");
+
+		// 3. No recovery path will ever replay it: `recover()` skips every record
+		//    already marked `advanced` (:1629), and the restart quarantine only
+		//    rewrites `accepted && !advanced` records (:1118). The turn is stranded.
+		expect(await broker.recover()).toEqual([]);
+		const afterRestart = new WorkflowGateBroker("run-5599", new FileGateStore(file), { advance: () => {} });
+		expect(afterRestart.listPendingGates()).toEqual([]);
+		expect(new FileGateStore(file).get(gate.gate_id)).toMatchObject({ status: "accepted", advanced: true });
+
+		// 4. And the downgrade must survive a restart. The loss cannot be persisted
+		//    (an `accepted` record may not carry a `lifecycle`; a `quarantined` one
+		//    must be `advanced:false`), and the in-memory set is empty in the new
+		//    runtime — so without the prior-runtime check this returned `completed`
+		//    again and handed back the same false success on a cross-restart
+		//    idempotent retry. Asserting it here is what makes the fix durable
+		//    rather than same-process only (#5599 review).
+		expect(afterRestart.lookupCompletedResolution(response).kind).toBe("accepted_incomplete");
+	});
+	it("resolves the originating gate continuation and exposes accepted-answer diagnostics (#5599)", async () => {
+		const store = new MemoryGateStore();
+		const brokerAnswer = "approve";
+		const continuation = Promise.withResolvers<unknown>();
+		const broker = new WorkflowGateBroker("run-5599-diagnostic", store, {
+			advance: () => {},
+			terminalizeAccepted: () => "not_published",
+			completeAccepted: record => continuation.resolve(record.answer),
+		});
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } },
+			{
+				activate: () => {},
+				isLive: () => true,
+			},
+		);
+		const before = broker.listWorkflowGateQueryRecords();
+		expect(before).toMatchObject([{ gate_id: gate.gate_id, tag: "pending", answer_recorded: false }]);
+
+		await broker.resolve({ gate_id: gate.gate_id, answer: brokerAnswer, idempotency_key: "diag-5599" });
+		expect(await continuation.promise).toBe(brokerAnswer);
+		expect(broker.listWorkflowGateQueryRecords()).toMatchObject([
+			{
+				gate_id: gate.gate_id,
+				tag: "accepted",
+				answer_recorded: true,
+				post_accept_disposition: "advanced",
+				resolved_at: expect.any(String),
+			},
+		]);
+	});
+	it("refuses a direct resolveGate replay the runtime cannot prove resolved (#5599 review)", async () => {
+		// `lookupCompletedResolution` is not the only way back in: `resolve()` has its own
+		// accepted-record idempotency branch that returned `record.resolution` directly. A
+		// caller retrying through the broker API rather than the SDK lookup bypassed the
+		// provenance check entirely and got the same false success.
+		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-5599-replay-")), "gates.json");
+		const broker = new WorkflowGateBroker("run-replay", new FileGateStore(file), {
+			advance: () => {},
+			terminalizeAccepted: () => "not_published",
+			completeAccepted: record => {
+				throw new Error(`workflow gate ${record.gate.gate_id} lost its continuation owner`);
+			},
+		});
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } },
+			liveContinuation(),
+		);
+		const response = { gate_id: gate.gate_id, answer: "approve", idempotency_key: "idem-replay" };
+		await expect(broker.resolve(response)).rejects.toThrow(/lost its continuation owner/);
+
+		// Same runtime: the loss is remembered, so the replay is refused rather than served.
+		await expect(broker.resolve(response)).rejects.toThrow(/cannot prove its continuation was resolved/);
+
+		// New runtime over the same store: the in-memory loss set is empty, so provenance is
+		// the only thing left that can refuse it.
+		const afterRestart = new WorkflowGateBroker("run-replay", new FileGateStore(file), { advance: () => {} });
+		await expect(afterRestart.resolve(response)).rejects.toThrow(/cannot prove its continuation was resolved/);
 	});
 });

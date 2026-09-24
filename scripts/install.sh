@@ -333,6 +333,48 @@ curl_github() {
     fi
 }
 
+# api.github.com allows only 60 unauthenticated requests/hour per IP, and a
+# shared/NAT'd host can arrive with that budget already spent. The github.com
+# web route 302s /releases/latest to /releases/tag/<tag> without touching the
+# API limit, and it is the same origin the binaries download from.
+resolve_stable_tag_via_web() {
+    location=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+        -A "gjc-install" \
+        --retry 3 --retry-delay 1 \
+        "https://github.com/${REPO}/releases/latest" 2>/dev/null) || return 1
+    case "$location" in
+        "https://github.com/${REPO}/releases/tag/"*) ;;
+        *) return 1 ;;
+    esac
+    tag=${location#"https://github.com/${REPO}/releases/tag/"}
+    case "$tag" in
+        */* | "") return 1 ;;
+    esac
+    is_stable_release_tag "$tag" || return 1
+    printf '%s' "$tag"
+}
+
+curl_github_status() {
+    url="$1"
+    out="$2"
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [ -n "$token" ] && trusted_github_url "$url"; then
+        prepare_github_auth_header "$token"
+        curl -sSL --retry 3 --retry-delay 1 \
+            -A "gjc-install" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "@${AUTH_HDR}" \
+            -o "$out" -w "%{http_code}" "$url"
+    else
+        curl -sSL --retry 3 --retry-delay 1 \
+            -A "gjc-install" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o "$out" -w "%{http_code}" "$url"
+    fi
+}
+
 curl_github_optional() {
     url="$1"
     out="$2"
@@ -609,10 +651,30 @@ For branch/commit source installs, re-run with --source --ref <git-ref> and an e
         fi
     else
         echo "Fetching latest stable GitHub release..."
-        if ! curl_github "${GITHUB_API}/repos/${REPO}/releases/latest" "$json_tmp"; then
-            die "Failed to fetch the latest GitHub release"
+        api_status=""
+        if api_status=$(curl_github_status "${GITHUB_API}/repos/${REPO}/releases/latest" "$json_tmp"); then
+            case "$api_status" in
+                200)
+                    LATEST=$(extract_json_string "$json_tmp" "tag_name")
+                    ;;
+                403|429) LATEST="" ;;
+                *)
+                    LATEST=""
+                    ;;
+            esac
+        else
+            api_status="transport"
+            LATEST=""
         fi
-        LATEST=$(extract_json_string "$json_tmp" "tag_name")
+        if [ "$api_status" = "403" ] || [ "$api_status" = "429" ]; then
+            LATEST=$(resolve_stable_tag_via_web) || LATEST=""
+            if [ -z "$LATEST" ]; then
+                die "Failed to fetch the latest GitHub release. If api.github.com is rate limited, set GITHUB_TOKEN or GH_TOKEN and retry."
+            fi
+            echo "api.github.com was unavailable; resolved ${LATEST} through github.com instead."
+        elif [ -z "$LATEST" ]; then
+            die "Failed to fetch the latest GitHub release. If api.github.com is rate limited, set GITHUB_TOKEN or GH_TOKEN and retry."
+        fi
     fi
 
     if [ -n "$REF" ]; then
@@ -762,13 +824,27 @@ install_via_bun() {
     echo "Run 'gjc' to get started!"
 }
 
+# A symlinked destination is never replaced with a regular binary. Called once
+# before the download so a refusal costs an lstat instead of the whole release
+# asset, and again immediately before the replace as the TOCTOU guard. Both call
+# sites share this message.
+refuse_symlinked_destination() {
+    [ -h "$DEST_PATH" ] || return 0
+    die "Refusing to replace symlink ${DEST_PATH} with a regular binary. It is most likely a development link created by 'bun run dev:link'; update that checkout through its own workflow, remove the symlink, or set GJC_INSTALL_DIR to a different directory."
+}
+
 install_binary() {
     detect_platform
     require_official_github_origins
     acquire_lock
-    resolve_release_tag
 
     DEST_PATH="${INSTALL_DIR}/gjc"
+
+    # Nothing about this decision depends on the downloaded bytes, so make it
+    # before spending the download on a destination that can never be published.
+    refuse_symlinked_destination
+    resolve_release_tag
+
     exclusive_tmp "gjc.download"
     DOWNLOAD_TMP="$LAST_EXCLUSIVE_TMP"
     BACKUP_PATH=""
@@ -795,9 +871,7 @@ install_binary() {
     VERIFIED_RELEASE_SHA256="$expected"
     chmod +x "$DOWNLOAD_TMP"
 
-    if [ -h "$DEST_PATH" ]; then
-        die "Refusing to replace symlink ${DEST_PATH} with a regular binary. Remove the symlink or set GJC_INSTALL_DIR."
-    fi
+    refuse_symlinked_destination
 
     if [ -e "$DEST_PATH" ]; then
         exclusive_tmp "gjc.bak"

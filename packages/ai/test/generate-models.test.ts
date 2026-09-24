@@ -1,18 +1,18 @@
 import { describe, expect, it } from "bun:test";
 import {
 	injectAlibabaTokenPlanModels,
-	injectCodexAstraModel,
+	injectCodexGpt6Models,
 	injectImageGenerationModels,
 	injectMuseSparkModels,
 } from "../scripts/generate-models";
 import type { Model } from "../src/types";
 
-describe("injectCodexAstraModel", () => {
-	it("adds the reviewed Codex fallback exactly once", () => {
+describe("injectCodexGpt6Models", () => {
+	it("adds the reviewed Codex fallbacks exactly once", () => {
 		const models: Model[] = [];
 
-		injectCodexAstraModel(models);
-		injectCodexAstraModel(models);
+		injectCodexGpt6Models(models);
+		injectCodexGpt6Models(models);
 
 		expect(models).toEqual([
 			expect.objectContaining({
@@ -27,7 +27,31 @@ describe("injectCodexAstraModel", () => {
 				preferWebsockets: true,
 				priority: 1,
 			}),
+			expect.objectContaining({
+				id: "gpt-6-sol",
+				name: "GPT-6-Sol",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: 272_000,
+				maxTokens: 128_000,
+				preferWebsockets: true,
+			}),
+			expect.objectContaining({
+				id: "gpt-6-luna",
+				name: "GPT-6-Luna",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: 272_000,
+				maxTokens: 128_000,
+				preferWebsockets: true,
+			}),
 		]);
+		expect(models.filter(model => model.id === "gpt-6-sol")).toHaveLength(1);
+		expect(models.find(model => model.id === "gpt-6-sol")).not.toHaveProperty("priority");
 	});
 
 	it("preserves authenticated discovery metadata", () => {
@@ -45,9 +69,9 @@ describe("injectCodexAstraModel", () => {
 		};
 		const models: Model[] = [discovered];
 
-		injectCodexAstraModel(models);
+		injectCodexGpt6Models(models);
 
-		expect(models).toEqual([discovered]);
+		expect(models.find(model => model.id === "gpt-6-astra")).toEqual(discovered);
 	});
 });
 
@@ -172,7 +196,7 @@ describe("injectImageGenerationModels", () => {
 });
 
 describe("injectAlibabaTokenPlanModels", () => {
-	it("adds the DeepSeek and Qwen 3.8 Max fallbacks exactly once", () => {
+	it("adds the DeepSeek, GLM-5.3, and Qwen 3.8 Max fallbacks exactly once", () => {
 		const models: Model[] = [];
 
 		injectAlibabaTokenPlanModels(models);
@@ -191,6 +215,33 @@ describe("injectAlibabaTokenPlanModels", () => {
 				reasoning: true,
 				contextWindow: 1_000_000,
 				maxTokens: 384_000,
+			}),
+			expect.objectContaining({
+				id: "deepseek-v4-pro-0813",
+				name: "DeepSeek V4 Pro 0813",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: true,
+				contextWindow: 1_000_000,
+				maxTokens: 384_000,
+			}),
+			expect.objectContaining({
+				id: "deepseek-v4.1-flash",
+				name: "DeepSeek V4.1 Flash",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: true,
+				contextWindow: 1_000_000,
+				maxTokens: 384_000,
+			}),
+			expect.objectContaining({
+				id: "glm-5.3",
+				name: "GLM-5.3",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: true,
+				contextWindow: 1_000_000,
+				maxTokens: 131_072,
 			}),
 			expect.objectContaining({
 				id: "qwen3.8-max",

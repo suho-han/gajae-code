@@ -64,6 +64,8 @@ for (const scenario of [
 	"write_failure",
 	"startup_failure",
 	"stale_failure",
+	"unproven_close",
+	"unproven_verify",
 ] as const) {
 	test(`spawn effect marker: ${scenario}`, async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-marker-"));
@@ -76,6 +78,10 @@ for (const scenario of [
 		const launchedProof = { ...proof };
 		if (scenario === "missing_pid") delete launchedProof.pid;
 		if (scenario === "missing_incarnation") delete launchedProof.processIncarnation;
+
+		// A substrate that cannot be proven released keeps the claim uncertain; a
+		// proven close or gone observation terminalizes it (#5542, #5728).
+		const unprovenRelease = scenario === "unproven_close" || scenario === "unproven_verify";
 		const layer: SpawnPromptLayer = {
 			awaitRegistration: async () => {
 				registrations += 1;
@@ -114,10 +120,10 @@ for (const scenario of [
 					if (scenario === "write_failure") await fs.mkdir(markerPath(), { recursive: true });
 					return { ok: true, proof: launchedProof };
 				},
-				verify: async () => "verified",
+				verify: async () => (scenario === "unproven_verify" ? "mismatch" : "verified"),
 				close: async () => {
 					closes += 1;
-					return { ok: true };
+					return { ok: scenario !== "unproven_close" };
 				},
 			},
 		});
@@ -126,7 +132,6 @@ for (const scenario of [
 			await attest(broker, root);
 			const response = await spawn(broker, root);
 			expect(response.ok).toBe(false);
-			expect(closes).toBe(1);
 			const store = new SpawnAuthorityStore(
 				broker.settings.agentDir,
 				await getBrokerIdentityKey(broker.settings.agentDir),
@@ -140,14 +145,36 @@ for (const scenario of [
 				expect(store.claims()[0]?.state).toBe("pre_send_rejected");
 				expect(await Bun.file(markerPath()).exists()).toBe(false);
 				expect(registrations).toBe(0);
-			} else {
+				expect(closes).toBe(1);
+			} else if (unprovenRelease) {
+				// The substrate could not be proven released, so the claim must stay
+				// uncertain instead of being collapsed into an ordinary failure.
 				expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				expect(store.claims()[0]?.failure?.code).toBe("child_registration_release_unproven");
 				expect(JSON.stringify(response)).not.toContain(task);
+				expect(store.claims()[0]?.state).toBe("uncertain");
+				expect(registrations).toBe(1);
+				expect(closes).toBe(scenario === "unproven_close" ? 1 : 0);
+			} else {
+				// A proven close or gone observation terminalizes: the substrate is gone,
+				// so reporting uncertainty here would be a lie (#5728).
+				expect(response).toMatchObject({
+					ok: false,
+					error: {
+						code: "spawn_failed",
+						details: {
+							code: scenario === "stale_failure" ? "child_registration_timeout" : "child_registration_failed",
+						},
+					},
+				});
+				expect(JSON.stringify(response)).not.toContain(task);
+				expect(store.claims()[0]?.state).toBe("pre_send_rejected");
 				if (scenario === "write_failure") expect(registrations).toBe(0);
 				else {
-					expect(store.claims()[0]?.state).toBe("uncertain");
+					expect(registrations).toBe(1);
 					expect(JSON.stringify(response).includes("startup/failed")).toBe(scenario === "startup_failure");
 				}
+				expect(closes).toBe(1);
 			}
 		} finally {
 			await broker.stop();
@@ -230,6 +257,96 @@ test("real session.spawn publishes lifecycle authority and registers a live chil
 		if (launchedProof) await provider.close(launchedProof);
 		await broker.stop();
 		setLifecycleCommandResolverForTest(broker, undefined);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("managed task.dag advance still publishes lifecycle authority before seed delivery", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-marker-"));
+	const agentDir = path.join(root, "agent");
+	let childId = "";
+	let effectMarker = "";
+	const layer: SpawnPromptLayer = {
+		awaitRegistration: async () => ({ ok: false }),
+		dispatch: async () => {
+			throw new Error("Seed must not be sent before registration");
+		},
+		reconcile: async () => ({ status: "unknown" }),
+	};
+	const broker = new Broker({
+		agentDir,
+		masterCapabilityVerifier: verifier,
+		spawnPromptLayer: layer,
+		spawnSubstrateProvider: {
+			launch: async spec => {
+				childId = spec.childSessionId;
+				effectMarker = spec.env?.GJC_LIFECYCLE_REQUEST_ID ?? "";
+				return {
+					ok: true,
+					proof: { ...proof },
+				};
+			},
+			verify: async () => "verified",
+			close: async () => ({ ok: true }),
+		},
+	});
+	await broker.start();
+	try {
+		await attest(broker, root);
+		await fs.mkdir(path.join(root, "a"), { recursive: true });
+		const { managedIdentity } = await import("../src/sdk/broker/managed-task-dag");
+		const define = await broker.handleRequest("task.dag", {
+			action: "define",
+			controlRoot: root,
+			enrollmentId: "enrollment",
+			graphId: "g",
+			expectedRevision: 0,
+			ownerSessionId: ownerId,
+			attestationEpoch: epoch,
+			masterCapability: "fixture-grant",
+			worktrees: [root],
+			nodes: [
+				{
+					id: "a",
+					task,
+					workspace: path.join(root, "a"),
+					predecessors: [],
+					criteriaIdentity: managedIdentity("criteria"),
+					validations: [{ name: "check", command: "true" }],
+					resources: [{ kind: "integration", identity: "marker-a", mode: "write" }],
+					artifacts: [],
+				},
+			],
+		});
+		expect(define).toMatchObject({ ok: true });
+		const advance = await broker.handleRequest(
+			"task.dag",
+			{
+				action: "advance",
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				graphId: "g",
+				nodeId: "a",
+				expectedRevision: 1,
+				cwd: path.join(root, "a"),
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: "fixture-grant",
+				worktrees: [root],
+			},
+			"managed-marker-key",
+		);
+		expect(advance.ok).toBe(false);
+		expect(childId.length).toBeGreaterThan(0);
+		expect(effectMarker.length).toBeGreaterThan(0);
+		const store = new SpawnAuthorityStore(
+			broker.settings.agentDir,
+			await getBrokerIdentityKey(broker.settings.agentDir),
+		);
+		await store.open();
+		expect(store.claims().some(claim => claim.childId === childId)).toBe(true);
+	} finally {
+		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 30_000);

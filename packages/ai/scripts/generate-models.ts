@@ -74,14 +74,20 @@ function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
 }
 
 /**
- * Keep the reviewed GPT-6 Astra Codex row available without authenticated
- * discovery. The values mirror OpenAI Codex 0.153.4's bundled model catalog;
- * generated policies apply the public API pricing and freeform tool metadata.
+ * Keep the reviewed GPT-6 Codex rows available without authenticated discovery.
+ * Astra mirrors OpenAI Codex 0.153.4's bundled model catalog; Sol and Luna ship
+ * with the same Codex transport and envelope, whose 272K prompt budget is the
+ * short-context boundary OpenAI publishes for the whole GPT-6 family
+ * (https://developers.openai.com/api/docs/pricing). Generated policies apply the
+ * public API pricing and freeform tool metadata.
+ *
+ * Only Astra carries `priority: 1`; Sol and Luna stay in default catalog order
+ * so the flagship remains the first Codex suggestion.
  */
-export function injectCodexAstraModel(models: Model[]): void {
-	const astra: Model<"openai-codex-responses"> = {
-		id: "gpt-6-astra",
-		name: "GPT-6-Astra",
+export function injectCodexGpt6Models(models: Model[]): void {
+	const gpt6 = (id: string, name: string, priority?: number): Model<"openai-codex-responses"> => ({
+		id,
+		name,
 		api: "openai-codex-responses",
 		provider: "openai-codex",
 		baseUrl: "https://chatgpt.com/backend-api",
@@ -91,10 +97,17 @@ export function injectCodexAstraModel(models: Model[]): void {
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		preferWebsockets: true,
-		priority: 1,
-	};
-	const hasAstra = models.some(model => model.provider === astra.provider && model.id === astra.id);
-	if (!hasAstra) models.push(astra);
+		...(priority === undefined ? {} : { priority }),
+	});
+	const bundled: Model<"openai-codex-responses">[] = [
+		gpt6("gpt-6-astra", "GPT-6-Astra", 1),
+		gpt6("gpt-6-sol", "GPT-6-Sol"),
+		gpt6("gpt-6-luna", "GPT-6-Luna"),
+	];
+	for (const model of bundled) {
+		const exists = models.some(existing => existing.provider === model.provider && existing.id === model.id);
+		if (!exists) models.push(model);
+	}
 }
 
 /**
@@ -151,62 +164,70 @@ export function injectImageGenerationModels(models: Model[]): void {
 }
 
 /**
- * Keep the Alibaba Token Plan DeepSeek V4 Flash executor and non-preview
- * Qwen3.8 Max models available when authenticated catalog discovery is
- * unavailable during generation.
+ * Keep the Alibaba Token Plan DeepSeek V4 Flash executor, V4.1 Flash,
+ * V4 Pro 0813, GLM-5.3, and non-preview Qwen3.8 Max models available when
+ * authenticated catalog discovery is unavailable during generation.
+ *
+ * Model IDs follow Alibaba Model Studio's published Token Plan names:
+ * `deepseek-v4.1-flash`, `deepseek-v4-pro-0813`, and `glm-5.3` (the Token
+ * Plan short id; Model Studio also lists `ZHIPU/GLM-5.3`). Context and
+ * output envelopes copy the already-reviewed sibling rows:
+ * DeepSeek V4 Flash/Pro 1M/384K, GLM-5.2 1M/128K.
+ * https://www.alibabacloud.com/help/en/model-studio/models
  */
 export function injectAlibabaTokenPlanModels(models: Model[]): void {
-	const deepseek: Model<"openai-completions"> = {
-		id: "deepseek-v4-flash-0731",
-		name: "DeepSeek V4 Flash 0731",
+	const alibabaBaseUrl = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+	const completions = (
+		id: string,
+		name: string,
+		contextWindow: number,
+		maxTokens: number,
+	): Model<"openai-completions"> => ({
+		id,
+		name,
 		api: "openai-completions",
 		provider: "alibaba-token-plan",
-		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		baseUrl: alibabaBaseUrl,
 		reasoning: true,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 1_000_000,
-		maxTokens: 384_000,
+		contextWindow,
+		maxTokens,
 		compat: { supportsDeveloperRole: false },
-	};
-	const qwen: Model<"openai-responses"> = {
-		id: "qwen3.8-max",
-		name: "Qwen3.8 Max",
+	});
+	const responses = (id: string, name: string): Model<"openai-responses"> => ({
+		id,
+		name,
 		api: "openai-responses",
 		provider: "alibaba-token-plan",
-		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		baseUrl: alibabaBaseUrl,
 		reasoning: true,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 1_000_000,
 		maxTokens: 65_536,
 		compat: { supportsDeveloperRole: false },
-	};
-	const qwenPreview: Model<"openai-responses"> = {
-		id: "qwen3.8-max-preview",
-		name: "Qwen3.8 Max Preview",
-		api: "openai-responses",
-		provider: "alibaba-token-plan",
-		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
-		reasoning: true,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 1_000_000,
-		maxTokens: 65_536,
-		compat: { supportsDeveloperRole: false },
-	};
+	});
+	const metadata: Model[] = [
+		completions("deepseek-v4-flash-0731", "DeepSeek V4 Flash 0731", 1_000_000, 384_000),
+		completions("deepseek-v4-pro-0813", "DeepSeek V4 Pro 0813", 1_000_000, 384_000),
+		completions("deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1_000_000, 384_000),
+		completions("glm-5.3", "GLM-5.3", 1_000_000, 131_072),
+		responses("qwen3.8-max", "Qwen3.8 Max"),
+		responses("qwen3.8-max-preview", "Qwen3.8 Max Preview"),
+	];
 	for (let index = models.length - 1; index >= 0; index--) {
 		const model = models[index]!;
 		if (model.provider === "alibaba-token-plan" && model.id === "qwen-3.8-max") {
 			models.splice(index, 1);
 		}
 	}
-	for (const metadata of [deepseek, qwen, qwenPreview]) {
-		const existing = models.find(model => model.provider === "alibaba-token-plan" && model.id === metadata.id);
+	for (const entry of metadata) {
+		const existing = models.find(model => model.provider === "alibaba-token-plan" && model.id === entry.id);
 		if (existing) {
-			Object.assign(existing, metadata);
+			Object.assign(existing, entry);
 		} else {
-			models.push(metadata);
+			models.push(entry);
 		}
 	}
 }
@@ -581,7 +602,7 @@ function applyCodexPricingFallback(models: readonly Model[]): Model[] {
 // `claude-opus-*` prefix match: a future generation must be reviewed before we
 // assert capabilities for it. `claude-opus-vision.test.ts` imports this list and
 // fails when the catalog bundles a newer Opus generation than any declared here.
-export const VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS: readonly number[] = [4.8, 5];
+export const VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS: readonly number[] = [4.8, 5, 5.5];
 
 /**
  * Known separator-less generation aliases. Upstream normally writes
@@ -788,7 +809,7 @@ async function generateModels() {
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	allModels = applyClaudeOpusVisionCorrections(allModels);
-	injectCodexAstraModel(allModels);
+	injectCodexGpt6Models(allModels);
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
 	injectKiroModels(allModels);
